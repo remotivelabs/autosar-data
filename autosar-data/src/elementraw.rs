@@ -995,7 +995,11 @@ impl ElementRaw {
                     let (_, existing_element_indices) = elemtype
                         .find_sub_element(subelement.element_name(), version as u32)
                         .unwrap();
-                    let group_type = elemtype.find_common_group(&new_element_indices, &existing_element_indices);
+                    // find_common_group always succeeds here, since both index lists were returned by find_sub_element
+                    let Some(group_type) = elemtype.find_common_group(&new_element_indices, &existing_element_indices)
+                    else {
+                        continue;
+                    };
                     match group_type.content_mode() {
                         ContentMode::Sequence => {
                             // decide where to insert

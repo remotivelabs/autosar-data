@@ -651,7 +651,10 @@ impl<'a> ArxmlParser<'a> {
             // when elem_indices is empty, that means that this is the first sub-element or found the exact same element as last time
             // no ordering checks are possible
         } else {
-            let group_type = elemtype.find_common_group(elem_indices, new_elem_indices);
+            // find_common_group always succeeds here, since both index lists were returned by find_sub_element
+            let Some(group_type) = elemtype.find_common_group(elem_indices, new_elem_indices) else {
+                return Ok(());
+            };
             let mode = group_type.content_mode();
 
             match mode {
@@ -685,9 +688,8 @@ impl<'a> ArxmlParser<'a> {
         element: &ElementRaw,
     ) -> Result<(), AutosarDataError> {
         // get the parent type id, i.e. the type of the containing element or group
-        let datatype_mode = elemtype.get_sub_element_container_mode(elem_idx);
         // multiplicity only matters if the mode is Choice or Sequence - modes Mixed and Bag allow arbitrary amounts of all elements
-        if (datatype_mode == ContentMode::Sequence || datatype_mode == ContentMode::Choice)
+        if let Some(ContentMode::Sequence | ContentMode::Choice) = elemtype.get_sub_element_container_mode(elem_idx)
             && let Some(multiplicity) = elemtype.get_sub_element_multiplicity(elem_idx)
         {
             // multiplicity only needs to be checked if it is not Any - i.e. One / ZeroOrOne

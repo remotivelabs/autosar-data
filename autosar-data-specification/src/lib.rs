@@ -247,7 +247,7 @@ impl ElementType {
     }
 
     /// get the spec of a sub element from the index list
-    fn get_sub_element_spec<'a>(self, element_indices: &[usize]) -> Option<(&'a SubElement, u32)> {
+    fn get_sub_element_spec(self, element_indices: &[usize]) -> Option<(&'static SubElement, u32)> {
         if element_indices.is_empty() {
             return None;
         }
@@ -257,8 +257,8 @@ impl ElementType {
         let mut current_spec = spec;
         let mut current_ver_list_start = ver_list_start;
         // go through the hierarchy of groups: only the final index in element_indices can refer to a SubElement::Element
-        for idx in 0..(element_indices.len() - 1) {
-            match &current_spec[element_indices[idx]] {
+        for &index in &element_indices[..element_indices.len() - 1] {
+            match current_spec.get(index)? {
                 SubElement::Element { .. } => {
                     // elements are not allowed here
                     return None;
@@ -271,7 +271,8 @@ impl ElementType {
         }
 
         let last_idx = *element_indices.last().unwrap();
-        Some((&current_spec[last_idx], VERSION_INFO[current_ver_list_start + last_idx]))
+        let sub_element = current_spec.get(last_idx)?;
+        Some((sub_element, VERSION_INFO[current_ver_list_start + last_idx]))
     }
 
     /// get the version mask of a sub element
@@ -296,18 +297,21 @@ impl ElementType {
 
     /// get the `ContentMode` of the container of a sub element of the current `ElementType`
     ///
-    /// The sub element is identified by an index list, as returned by `find_sub_element()`
+    /// The sub element is identified by an index list, as returned by `find_sub_element()`.
+    /// Returns None if the index list does not identify a valid sub element.
     #[must_use]
-    pub fn get_sub_element_container_mode(&self, element_indices: &[usize]) -> ContentMode {
+    pub fn get_sub_element_container_mode(&self, element_indices: &[usize]) -> Option<ContentMode> {
+        // validate the index list; this also rejects an empty list
+        self.get_sub_element_spec(element_indices)?;
         if element_indices.len() < 2 {
             // length == 1: this element is a direct sub element, without any groups;
-            DATATYPES[self.typ as usize].mode
+            Some(DATATYPES[self.typ as usize].mode)
         } else {
             let len = element_indices.len() - 1;
             if let Some((SubElement::Group(groupid), _)) = self.get_sub_element_spec(&element_indices[..len]) {
-                DATATYPES[*groupid as usize].mode
+                Some(DATATYPES[*groupid as usize].mode)
             } else {
-                unreachable!("impossible: element container is not a group");
+                None
             }
         }
     }
@@ -377,19 +381,20 @@ impl ElementType {
     /// find the commmon group of two subelements of the current `ElementType`
     ///
     /// The subelements are identified by their index lists, returned by `find_sub_element`().
+    /// Returns None if either of the index lists is not valid for the current `ElementType`.
     ///
     /// In simple cases without sub-groups of elements, the "common group" is simply the element group of the current `ElementType`.
     #[must_use]
-    pub fn find_common_group(&self, element_indices: &[usize], element_indices2: &[usize]) -> GroupType {
+    pub fn find_common_group(&self, element_indices: &[usize], element_indices2: &[usize]) -> Option<GroupType> {
         let mut result = self.typ;
         let mut prefix_len = 0;
         while element_indices.len() > prefix_len
             && element_indices2.len() > prefix_len
             && element_indices[prefix_len] == element_indices2[prefix_len]
         {
-            let sub_elem = &ElementType::get_sub_elements(result)[element_indices[prefix_len]];
+            let sub_elem = ElementType::get_sub_elements(result).get(element_indices[prefix_len])?;
             match sub_elem {
-                SubElement::Element(_) => return GroupType(result),
+                SubElement::Element(_) => return Some(GroupType(result)),
                 SubElement::Group(groupid) => {
                     result = *groupid;
                 }
@@ -397,7 +402,7 @@ impl ElementType {
             prefix_len += 1;
         }
 
-        GroupType(result)
+        Some(GroupType(result))
     }
 
     /// are elements of this `ElementType` named in any Autosar version
@@ -825,6 +830,13 @@ mod test {
         // element_indices is nonsense
         let sub_elem_spec2 = prm_char_type.get_sub_element_spec(&[0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert!(sub_elem_spec2.is_none());
+        // out of range indices must not cause a panic
+        let sub_elem_spec2 = prm_char_type.get_sub_element_spec(&[999]);
+        assert!(sub_elem_spec2.is_none());
+        let sub_elem_spec2 = prm_char_type.get_sub_element_spec(&[999, 0]);
+        assert!(sub_elem_spec2.is_none());
+        let sub_elem_spec2 = prm_char_type.get_sub_element_spec(&[1, 999]);
+        assert!(sub_elem_spec2.is_none());
     }
 
     #[test]
@@ -837,6 +849,9 @@ mod test {
         assert_eq!(version_mask, version_mask2);
 
         let no_result = prm_char_type.get_sub_element_version_mask(&[]);
+        assert!(no_result.is_none());
+        // out of range indices must not cause a panic
+        let no_result = prm_char_type.get_sub_element_version_mask(&[999]);
         assert!(no_result.is_none());
     }
 
@@ -853,14 +868,27 @@ mod test {
 
         let no_result = prm_char_type.get_sub_element_multiplicity(&[]);
         assert!(no_result.is_none());
+        // out of range indices must not cause a panic
+        let no_result = prm_char_type.get_sub_element_multiplicity(&[999]);
+        assert!(no_result.is_none());
     }
 
     #[test]
     fn get_sub_element_container_mode() {
         let prm_char_type = get_prm_char_element_type();
         let (_, indices) = prm_char_type.find_sub_element(ElementName::Abs, u32::MAX).unwrap();
-        let mode = prm_char_type.get_sub_element_container_mode(&indices);
+        let mode = prm_char_type.get_sub_element_container_mode(&indices).unwrap();
         assert_eq!(mode, ContentMode::Sequence);
+
+        // an empty index list does not identify a sub element
+        let no_result = prm_char_type.get_sub_element_container_mode(&[]);
+        assert!(no_result.is_none());
+        // an index list whose prefix refers to a plain element (COND, not a group) must not cause a panic
+        let no_result = prm_char_type.get_sub_element_container_mode(&[0, 0]);
+        assert!(no_result.is_none());
+        // out of range indices must not cause a panic
+        let no_result = prm_char_type.get_sub_element_container_mode(&[999]);
+        assert!(no_result.is_none());
     }
 
     #[test]
@@ -871,11 +899,15 @@ mod test {
         let (_, indices_min) = prm_char_type.find_sub_element(ElementName::Min, u32::MAX).unwrap();
         // see the documentation on find_sub_element for the complex structure under PRM-CHAR
         // ABS and TOL share a sequence group (top level)
-        let group1 = prm_char_type.find_common_group(&indices_abs, &indices_tol);
+        let group1 = prm_char_type.find_common_group(&indices_abs, &indices_tol).unwrap();
         assert_eq!(group1.content_mode(), ContentMode::Sequence);
         // ABS and MIN have the second level choice group in common
-        let group2 = prm_char_type.find_common_group(&indices_abs, &indices_min);
+        let group2 = prm_char_type.find_common_group(&indices_abs, &indices_min).unwrap();
         assert_eq!(group2.content_mode(), ContentMode::Choice);
+
+        // out of range indices in the common prefix must not cause a panic
+        let no_result = prm_char_type.find_common_group(&[999, 0], &[999, 1]);
+        assert!(no_result.is_none());
     }
 
     #[test]
