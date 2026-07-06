@@ -672,6 +672,10 @@ impl Element {
     ///  - [`AutosarDataError::ForbiddenMoveToSubElement`]: The destination is a sub element of the source. Moving here is not possible
     ///  - [`AutosarDataError::NoFilesInModel`]: The operation cannot be completed because the model does not contain any files
     pub fn move_element_here(&self, move_element: &Element) -> Result<Element, AutosarDataError> {
+        if self == move_element {
+            // trying to move self into self never makes sense, and would deadlock
+            return Err(AutosarDataError::ForbiddenMoveToSubElement);
+        }
         let model_src = move_element.model()?;
         let model = self.model()?;
         let version_src = move_element.min_version()?;
@@ -725,6 +729,10 @@ impl Element {
     ///  - [`AutosarDataError::InvalidPosition`]: This sub element cannot be created at the requested position.
     ///  - [`AutosarDataError::NoFilesInModel`]: The operation cannot be completed because the model does not contain any files
     pub fn move_element_here_at(&self, move_element: &Element, position: usize) -> Result<Element, AutosarDataError> {
+        if self == move_element {
+            // trying to move self into self never makes sense, and would deadlock
+            return Err(AutosarDataError::ForbiddenMoveToSubElement);
+        }
         let model_src = move_element.model()?;
         let model = self.model()?;
         let version_src = move_element.min_version()?;
@@ -768,6 +776,13 @@ impl Element {
     ///  - [`AutosarDataError::ElementNotFound`]: The sub element was not found in this element
     ///  - [`AutosarDataError::ShortNameRemovalForbidden`]: It is not permitted to remove the SHORT-NAME of identifiable elements since this would result in invalid data
     pub fn remove_sub_element(&self, sub_element: Element) -> Result<(), AutosarDataError> {
+        if *self == sub_element {
+            // an element is never a sub element of itself; without this check the operation would deadlock
+            return Err(AutosarDataError::ElementNotFound {
+                target: self.element_name(),
+                parent: self.element_name(),
+            });
+        }
         let model = self.model()?;
         self.0.write().remove_sub_element(sub_element, &model)
     }
@@ -3151,6 +3166,27 @@ mod test {
         assert!(result.is_err());
         let result = el_ar_package.create_copied_sub_element_at(&el_ar_package, 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn element_self_reference_loop() {
+        let model = AutosarModel::new();
+        model.create_file("test.arxml", AutosarVersion::Autosar_00050).unwrap();
+        let el_autosar = model.root_element();
+        let el_ar_packages = el_autosar.create_sub_element(ElementName::ArPackages).unwrap();
+        let el_ar_package = el_ar_packages
+            .create_named_sub_element(ElementName::ArPackage, "Pkg")
+            .unwrap();
+
+        // removing an element from itself should return an error and should not deadlock
+        let result = el_ar_package.remove_sub_element(el_ar_package.clone());
+        assert!(matches!(result, Err(AutosarDataError::ElementNotFound { .. })));
+
+        // moving an element into itself should return an error and should not deadlock
+        let result = el_ar_packages.move_element_here(&el_ar_packages.clone());
+        assert!(matches!(result, Err(AutosarDataError::ForbiddenMoveToSubElement)));
+        let result = el_ar_packages.move_element_here_at(&el_ar_packages.clone(), 0);
+        assert!(matches!(result, Err(AutosarDataError::ForbiddenMoveToSubElement)));
     }
 
     #[test]
