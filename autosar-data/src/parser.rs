@@ -809,7 +809,7 @@ impl<'a> ArxmlParser<'a> {
         input: &[u8],
         character_data_spec: &CharacterDataSpec,
     ) -> Result<CharacterData, AutosarDataError> {
-        let trimmed_input = trim_byte_string(input);
+        let trimmed_input = input.trim_ascii();
         match character_data_spec {
             CharacterDataSpec::Enum { items } => {
                 let value = EnumItem::from_bytes(trimmed_input).map_err(|_| {
@@ -1026,19 +1026,6 @@ impl<'a> ArxmlParser<'a> {
         }
 
         false
-    }
-}
-
-fn trim_byte_string(input: &[u8]) -> &[u8] {
-    let mut len = input.len();
-    if len > 0 {
-        while input[len - 1].is_ascii_whitespace() {
-            len -= 1;
-        }
-        let start = input.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(len);
-        &input[start..len]
-    } else {
-        input
     }
 }
 
@@ -1643,6 +1630,28 @@ mod test {
         let mut parser = ArxmlParser::new(
             PathBuf::from("test_buffer.arxml"),
             EMPTY_CHARACTER_DATA.as_bytes(),
+            true,
+        );
+        let result = parser.parse_arxml();
+        assert!(result.is_ok());
+    }
+
+    const WHITESPACE_CHARACTER_DATA: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES>
+            <AR-PACKAGE UUID="   ">
+                <SHORT-NAME>x</SHORT-NAME>
+            </AR-PACKAGE>
+        </AR-PACKAGES>
+    </AUTOSAR>
+    "#;
+
+    #[test]
+    fn test_whitespace_character_data() {
+        // an attribute value consisting only of whitespace must not cause a panic while trimming
+        let mut parser = ArxmlParser::new(
+            PathBuf::from("test_buffer.arxml"),
+            WHITESPACE_CHARACTER_DATA.as_bytes(),
             true,
         );
         let result = parser.parse_arxml();
