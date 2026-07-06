@@ -906,8 +906,12 @@ impl Element {
         let model = self.model()?;
         // build a target string, which is either the absolute path or the relative path depending on whether a base label was provided
         let target_string = if let Some(base_label) = base_label {
-            // note - a reference can never occur outside a package, so we can unwrap Some(package) here without risking a panic
-            let ref_package_path = self.package()?.unwrap().path()?;
+            // a relative reference can only be resolved if the reference element is inside a package;
+            // this is not always the case, e.g. references inside AUTOSAR > ADMIN-DATA are outside any package
+            let ref_package_path = self
+                .package()?
+                .ok_or(AutosarDataError::InvalidReferenceBase)?
+                .path()?;
             let base_path = model
                 .resolve_reference_base(base_label, &ref_package_path)
                 .ok_or(AutosarDataError::InvalidReferenceBase)?;
@@ -1034,8 +1038,12 @@ impl Element {
                     .attribute_value(AttributeName::Base)
                     .and_then(|cdata| cdata.string_value())
                 {
-                    // note - a reference can never occur outside a package, so we can unwrap Some(package) here without risking a panic
-                    let ref_package_path = self.package()?.unwrap().path()?;
+                    // a relative reference can only be resolved if the reference element is inside a package;
+                    // this is not always the case, e.g. references inside AUTOSAR > ADMIN-DATA are outside any package
+                    let ref_package_path = self
+                        .package()?
+                        .ok_or(AutosarDataError::InvalidReference)?
+                        .path()?;
                     let reference_base = model
                         .resolve_reference_base(&base_label, &ref_package_path)
                         .ok_or(AutosarDataError::InvalidReference)?;
@@ -3732,6 +3740,40 @@ mod test {
         // model is deleted
         drop(model);
         assert!(el_fibex_element_ref.get_reference_target().is_err());
+    }
+
+    #[test]
+    fn relative_reference_outside_package() {
+        let model = AutosarModel::new();
+        model.create_file("test.arxml", AutosarVersion::Autosar_00050).unwrap();
+        let el_autosar = model.root_element();
+        let el_ar_package = el_autosar
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|arpkgs| arpkgs.create_named_sub_element(ElementName::ArPackage, "Package"))
+            .unwrap();
+
+        // create a reference element that is not inside any package: AUTOSAR > ADMIN-DATA > SDGS > SDG > SDX-REF
+        let el_sdx_ref = el_autosar
+            .create_sub_element(ElementName::AdminData)
+            .and_then(|admin_data| admin_data.create_sub_element(ElementName::Sdgs))
+            .and_then(|sdgs| sdgs.create_sub_element(ElementName::Sdg))
+            .and_then(|sdg| sdg.create_sub_element(ElementName::SdxRef))
+            .unwrap();
+        assert!(el_sdx_ref.is_reference());
+        assert!(el_sdx_ref.package().unwrap().is_none());
+
+        // setting a relative reference target must fail (not panic), since there is no
+        // containing package against which the base label could be resolved
+        let result = el_sdx_ref.set_relative_reference_target(&el_ar_package, "default");
+        assert!(matches!(result, Err(AutosarDataError::InvalidReferenceBase)));
+
+        // getting the reference target of a relative reference outside a package must also fail instead of panicking
+        el_sdx_ref.set_character_data("Package").unwrap();
+        el_sdx_ref
+            .set_attribute(AttributeName::Base, CharacterData::String("default".to_string()))
+            .unwrap();
+        let result = el_sdx_ref.get_reference_target();
+        assert!(matches!(result, Err(AutosarDataError::InvalidReference)));
     }
 
     #[test]
