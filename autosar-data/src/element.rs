@@ -2940,6 +2940,28 @@ mod test {
     }
 
     #[test]
+    fn element_creation_after_nonstrict_load() {
+        // a non-strict load retains elements which are not valid in the version of the file:
+        // PNC-VECTOR-LENGTH does not exist in Autosar 4.0.1
+        let file_content = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_4-0-1.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><ELEMENTS>
+                <SYSTEM><SHORT-NAME>Sys</SHORT-NAME><PNC-VECTOR-LENGTH>8</PNC-VECTOR-LENGTH></SYSTEM>
+            </ELEMENTS></AR-PACKAGE></AR-PACKAGES>
+        </AUTOSAR>"#;
+        let model = AutosarModel::new();
+        let (_, warnings) = model
+            .load_buffer(file_content.as_bytes(), OsString::from("test.arxml"), false)
+            .unwrap();
+        assert!(!warnings.is_empty());
+
+        // creating a new sub element must position it relative to the retained
+        // version-incompatible sub element instead of panicking
+        let el_system = model.get_element_by_path("/Pkg/Sys").unwrap();
+        el_system.create_sub_element(ElementName::FibexElements).unwrap();
+    }
+
+    #[test]
     fn parent() {
         let model = AutosarModel::new();
         model.create_file("test.arxml", AutosarVersion::Autosar_00050).unwrap();

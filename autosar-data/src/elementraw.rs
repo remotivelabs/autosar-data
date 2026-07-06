@@ -992,9 +992,14 @@ impl ElementRaw {
             // compare the new element to the existing elements
             for (idx, content_item) in self.content.iter().enumerate() {
                 if let ElementContent::Element(subelement) = content_item {
-                    let (_, existing_element_indices) = elemtype
+                    // fall back to searching with u32::MAX, because a non-strict load may have
+                    // retained existing sub elements which are not valid in the file's version
+                    let Some((_, existing_element_indices)) = elemtype
                         .find_sub_element(subelement.element_name(), version as u32)
-                        .unwrap();
+                        .or_else(|| elemtype.find_sub_element(subelement.element_name(), u32::MAX))
+                    else {
+                        continue;
+                    };
                     // find_common_group always succeeds here, since both index lists were returned by find_sub_element
                     let Some(group_type) = elemtype.find_common_group(&new_element_indices, &existing_element_indices)
                     else {
