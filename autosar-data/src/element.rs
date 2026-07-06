@@ -2325,6 +2325,10 @@ impl Element {
     ///  - [`AutosarDataError::ItemDeleted`]: The current element is in the deleted state and will be freed once the last reference is dropped
     ///  - [`AutosarDataError::ParentElementLocked`]: a parent element was locked and did not become available after waiting briefly.
     ///    The operation was aborted to avoid a deadlock, but can be retried.
+    ///  - [`AutosarDataError::InvalidFile`]: The file is part of a different model
+    ///  - [`AutosarDataError::FilesetModificationForbidden`]: The parent of the current element is not splittable, so the fileset of the current element cannot be modified
+    ///  - [`AutosarDataError::RootElementRemovalForbidden`]: The current element is the AUTOSAR root element, which cannot be removed from the last file containing it
+    ///  - [`AutosarDataError::ShortNameRemovalForbidden`]: The current element is a SHORT-NAME that would have to be deleted, which is not permitted
     ///
     pub fn remove_from_file(&self, file: &ArxmlFile) -> Result<(), AutosarDataError> {
         let parent_splittable = self.parent()?.is_none_or(|p| p.element_type().splittable() != 0);
@@ -2337,34 +2341,35 @@ impl Element {
                 let mut restricted_fileset = current_fileset;
                 restricted_fileset.remove(&weak_file);
                 if restricted_fileset.is_empty() {
-                    // the element will no longer be part of any file, so try to delete it
-                    if let Some(parent) = self.parent()? {
-                        let _ = parent.remove_sub_element(self.to_owned());
-                    }
-                }
-                // this works even if the element was just removed
-                self.0.write().file_membership = restricted_fileset;
+                    // the element would no longer be part of any file, so it must be deleted instead.
+                    let Some(parent) = self.parent()? else {
+                        return Err(AutosarDataError::RootElementRemovalForbidden);
+                    };
+                    parent.remove_sub_element(self.to_owned())
+                } else {
+                    self.0.write().file_membership = restricted_fileset;
 
-                // update all sub elements with non-default file_membership
-                let mut to_delete = Vec::new();
-                for (_, subelem) in self.elements_dfs() {
-                    // only need to care about those where file_membership is not empty. All other inherit from their parent
-                    if !subelem.0.read().file_membership.is_empty() {
-                        subelem.0.write().file_membership.remove(&weak_file);
-                        // if the file_membership just went to empty, then subelem should be deleted
-                        if subelem.0.read().file_membership.is_empty() {
-                            to_delete.push(subelem);
+                    // update all sub elements with non-default file_membership
+                    let mut to_delete = Vec::new();
+                    for (_, subelem) in self.elements_dfs() {
+                        // only need to care about those where file_membership is not empty. All other inherit from their parent
+                        if !subelem.0.read().file_membership.is_empty() {
+                            subelem.0.write().file_membership.remove(&weak_file);
+                            // if the file_membership just went to empty, then subelem should be deleted
+                            if subelem.0.read().file_membership.is_empty() {
+                                to_delete.push(subelem);
+                            }
                         }
                     }
-                }
-                // delete elements that are no longer in any file
-                for delete_elem in to_delete {
-                    if let Ok(Some(parent)) = delete_elem.parent() {
-                        let _ = parent.remove_sub_element(delete_elem);
+                    // delete elements that are no longer in any file
+                    for delete_elem in to_delete {
+                        if let Ok(Some(parent)) = delete_elem.parent() {
+                            let _ = parent.remove_sub_element(delete_elem);
+                        }
                     }
-                }
 
-                Ok(())
+                    Ok(())
+                }
             } else {
                 // adding a file from a different model is not permitted
                 Err(AutosarDataError::InvalidFile)
@@ -4360,6 +4365,44 @@ mod test {
         el_ar_package.remove_from_file(&file2).unwrap();
         assert!(el_ar_package.get_sub_element(ElementName::Elements).is_none());
         assert!(el_ar_package.remove_from_file(&file2).is_err());
+    }
+
+    #[test]
+    fn remove_from_last_file() {
+        let model = AutosarModel::new();
+        let file = model.create_file("test.arxml", AutosarVersion::LATEST).unwrap();
+        let el_autosar = model.root_element();
+        let el_ar_packages = el_autosar.create_sub_element(ElementName::ArPackages).unwrap();
+        let el_ar_package = el_ar_packages
+            .create_named_sub_element(ElementName::ArPackage, "Pkg")
+            .unwrap();
+
+        // removing the root element from the only file is forbidden, since the root element cannot be deleted
+        let result = el_autosar.remove_from_file(&file);
+        assert!(matches!(result, Err(AutosarDataError::RootElementRemovalForbidden)));
+        // the model remains intact and usable
+        assert_eq!(model.files().count(), 1);
+        assert!(el_autosar.min_version().is_ok());
+        assert!(file.serialize().is_ok());
+
+        // CHAPTER is both identifiable and splittable, so remove_from_file can be called for its
+        // SHORT-NAME sub element, but deleting a SHORT-NAME is forbidden and the failure must be reported
+        let el_chapter = el_ar_package
+            .create_sub_element(ElementName::Elements)
+            .and_then(|elements| elements.create_named_sub_element(ElementName::Documentation, "Doc"))
+            .and_then(|doc| doc.create_sub_element(ElementName::DocumentationContent))
+            .and_then(|content| content.create_named_sub_element(ElementName::Chapter, "Chap"))
+            .unwrap();
+        let el_short_name = el_chapter.get_sub_element(ElementName::ShortName).unwrap();
+        let result = el_short_name.remove_from_file(&file);
+        assert!(matches!(result, Err(AutosarDataError::ShortNameRemovalForbidden)));
+        // the SHORT-NAME element is unchanged and still part of the file
+        assert_eq!(el_chapter.item_name().unwrap(), "Chap");
+        assert!(!el_short_name.file_membership().unwrap().1.is_empty());
+
+        // an ordinary element is deleted when it is removed from the only file that contains it
+        el_ar_package.remove_from_file(&file).unwrap();
+        assert!(model.get_element_by_path("/Pkg").is_none());
     }
 
     #[test]

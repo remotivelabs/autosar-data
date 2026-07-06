@@ -298,6 +298,10 @@ pub enum AutosarDataError {
     #[error("the SHORT-NAME sub element may not be removed")]
     ShortNameRemovalForbidden,
 
+    /// The AUTOSAR root element cannot be removed from the last file containing it, since deleting it is not permitted
+    #[error("the AUTOSAR root element may not be removed from the last file containing it")]
+    RootElementRemovalForbidden,
+
     /// get/set reference target was called for an element that is not a reference
     #[error("The current element is not a reference")]
     NotReferenceElement,
