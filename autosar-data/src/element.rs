@@ -2079,8 +2079,8 @@ impl Element {
                 && let Some((_, indices)) = elemtype_new
                     .find_sub_element(sub_element.element_name(), target_version as u32)
                     .or(elemtype_new.find_sub_element(sub_element.element_name(), u32::MAX))
+                && let Some(version_mask) = elemtype_new.get_sub_element_version_mask(&indices)
             {
-                let version_mask = self.element_type().get_sub_element_version_mask(&indices).unwrap();
                 overall_version_mask &= version_mask;
                 if !target_version.compatible(version_mask) {
                     compat_errors.push(CompatibilityError::IncompatibleElement {
