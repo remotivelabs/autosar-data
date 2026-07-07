@@ -58,7 +58,7 @@ impl AutosarModel {
         }
         .wrap();
         let model = AutosarModelRaw {
-            files: Vec::new(),
+            files: Arc::new(parking_lot::Mutex::new(Vec::new())),
             identifiables: FxIndexMap::default(),
             reference_origins: FxHashMap::default(),
             relative_reference_origins: FxHashMap::default(),
@@ -102,9 +102,12 @@ impl AutosarModel {
         filename: P,
         version: AutosarVersion,
     ) -> Result<ArxmlFile, AutosarDataError> {
-        let mut data = self.0.write();
+        // the file list lock is held for the whole operation, so that concurrent calls of
+        // create_file / load_buffer / remove_file cannot interleave
+        let file_list = self.file_list();
+        let mut locked_file_list = file_list.lock();
 
-        if data.files.iter().any(|af| af.filename() == filename.as_ref()) {
+        if locked_file_list.iter().any(|af| af.filename() == filename.as_ref()) {
             return Err(AutosarDataError::DuplicateFilenameError {
                 verb: "create",
                 filename: filename.as_ref().to_path_buf(),
@@ -113,10 +116,10 @@ impl AutosarModel {
 
         let new_file = ArxmlFile::new(filename, version, self);
 
-        data.files.push(new_file.clone());
+        locked_file_list.push(new_file.clone());
 
         // every file contains the root element (but not its children)
-        let _ = data.root_element.add_to_file_restricted(&new_file);
+        let _ = self.root_element().add_to_file_restricted(&new_file);
 
         Ok(new_file)
     }
@@ -166,10 +169,14 @@ impl AutosarModel {
         filename: PathBuf,
         strict: bool,
     ) -> Result<(ArxmlFile, Vec<AutosarDataError>), AutosarDataError> {
-        if self.files().any(|file| file.filename() == filename) {
+        // quick check for a duplicate filename, so that duplicate data is rejected before the
+        // expensive parsing step. This check is not authoritative: it is repeated below while
+        // the file list lock is held
+        if self.file_list().lock().iter().any(|file| file.filename() == filename) {
             return Err(AutosarDataError::DuplicateFilenameError { verb: "load", filename });
         }
 
+        // no lock is held while parsing, so any number of files can be parsed in parallel
         let mut parser = ArxmlParser::new(filename.clone(), buffer, strict);
         let root_element = parser.parse_arxml()?;
         let version = parser.get_fileversion();
@@ -181,12 +188,21 @@ impl AutosarModel {
         }
         .wrap();
 
-        if self.0.read().files.is_empty() {
+        // the file list lock is held from here to the end of the load operation. It serializes
+        // the integration of the parsed data into the model
+        let file_list = self.file_list();
+        let mut locked_file_list = file_list.lock();
+
+        if locked_file_list.iter().any(|file| file.filename() == filename) {
+            return Err(AutosarDataError::DuplicateFilenameError { verb: "load", filename });
+        }
+
+        if locked_file_list.is_empty() {
             root_element.set_parent(ElementOrModel::Model(self.downgrade()));
             root_element.0.write().file_membership.insert(arxml_file.downgrade());
             self.0.write().root_element = root_element;
         } else {
-            let result = self.merge_file_data(&root_element, arxml_file.downgrade());
+            let result = self.merge_file_data(&root_element, arxml_file.downgrade(), &locked_file_list);
             if let Err(error) = result {
                 let _ = self.root_element().remove_from_file(&arxml_file);
                 return Err(error);
@@ -246,7 +262,7 @@ impl AutosarModel {
             }
         }
 
-        data.files.push(arxml_file.clone());
+        locked_file_list.push(arxml_file.clone());
 
         Ok((arxml_file, parser.warnings))
     }
@@ -259,9 +275,14 @@ impl AutosarModel {
     // These are the points where the overall elements can be split into different arxml files, or, while loading, merged.
     // Unfortunately, the standard says nothing about how this should be done, so the algorithm here is just a guess.
     // In the wild, only merging at the AR-PACKAGES and at the ELEMENTS level exists. Everything else seems like a bad idea anyway.
-    fn merge_file_data(&self, new_root: &Element, new_file: WeakArxmlFile) -> Result<(), AutosarDataError> {
+    fn merge_file_data(
+        &self,
+        new_root: &Element,
+        new_file: WeakArxmlFile,
+        file_list: &[ArxmlFile],
+    ) -> Result<(), AutosarDataError> {
         let root = self.root_element();
-        let files: HashSet<WeakArxmlFile> = self.files().map(|f| f.downgrade()).collect();
+        let files: HashSet<WeakArxmlFile> = file_list.iter().map(ArxmlFile::downgrade).collect();
 
         Self::merge_element(&root, &files, new_root, &new_file).map_err(|e| {
             // transform ElementInsertionConflict into InvalidFileMerge
@@ -628,18 +649,21 @@ impl AutosarModel {
     /// # }
     /// ```
     pub fn remove_file(&self, file: &ArxmlFile) {
-        let mut locked_model = self.0.write();
-        let find_result = locked_model
-            .files
+        // the file list lock is held for the whole operation, so that concurrent calls of
+        // create_file / load_buffer / remove_file cannot interleave
+        let file_list = self.file_list();
+        let mut locked_file_list = file_list.lock();
+
+        let find_result = locked_file_list
             .iter()
             .enumerate()
             .find(|(_, f)| *f == file)
             .map(|(pos, _)| pos);
-        // find_result is stored first so that the lock on model is dropped
         if let Some(pos) = find_result {
-            locked_model.files.swap_remove(pos);
-            if locked_model.files.is_empty() {
+            locked_file_list.swap_remove(pos);
+            if locked_file_list.is_empty() {
                 // no other files remain in the model, so it reverts to being empty
+                let mut locked_model = self.0.write();
                 locked_model.root_element.0.write().content.clear();
                 locked_model.root_element.set_file_membership(HashSet::new());
                 locked_model.identifiables.clear();
@@ -647,7 +671,6 @@ impl AutosarModel {
                 locked_model.relative_reference_origins.clear();
                 locked_model.reference_bases.clear();
             } else {
-                drop(locked_model);
                 // other files still contribute elements, so only the elements specifically associated with this file should be removed
                 let _ = self.root_element().remove_from_file(file);
             }
@@ -732,6 +755,14 @@ impl AutosarModel {
     #[must_use]
     pub fn files(&self) -> ArxmlFileIterator {
         ArxmlFileIterator::new(self.clone())
+    }
+
+    /// get the shared list of files in the model
+    ///
+    /// The returned mutex is held across model-lock acquisitions by `load_buffer`, `create_file`
+    /// and `remove_file`, therefore it must only be locked while holding no other lock.
+    pub(crate) fn file_list(&self) -> Arc<parking_lot::Mutex<Vec<ArxmlFile>>> {
+        self.0.read().files.clone()
     }
 
     /// Get a reference to the root ```<AUTOSAR ...>``` element of this model
@@ -983,7 +1014,8 @@ impl AutosarModel {
                         else {
                             continue;
                         };
-                        let Some(base_path) = self.resolve_reference_base(base_label, &package_path) else {
+                        let Some(base_path) = locked_model.resolve_reference_base_internal(base_label, &package_path)
+                        else {
                             continue;
                         };
                         if let Some(rest) = target_path.strip_prefix(&base_path) {
@@ -1178,41 +1210,7 @@ impl AutosarModel {
 
     pub(crate) fn resolve_reference_base(&self, base: &str, ref_package_path: &str) -> Option<String> {
         let model = self.0.read();
-        let mut current_base = base;
-        let mut path_components = VecDeque::with_capacity(0);
-        let mut ref_package_path = ref_package_path;
-        loop {
-            // get (potentially) a list of reference bases that all have the requested base label
-            let ref_base_info_list = model.reference_bases.get(current_base)?;
-            // select the most applicable reference base from the list based on the owner_package_path (longest prefix match)
-            let ref_base_info = ref_base_info_list
-                .iter()
-                .filter(|info| ref_package_path.starts_with(&info.owner_package_path))
-                .max_by_key(|info| info.owner_package_path.len())?;
-
-            // base is relative to a package, so the path components of the package need to be added to the path
-            if let Some(package_ref_base) = &ref_base_info.package_ref_base {
-                // the reference base uses (at least) another reference base as its own base, so we
-                // loop and build up the path components until we reach a reference base that is absolute
-                path_components.push_front(&ref_base_info.package_ref);
-                current_base = package_ref_base;
-                ref_package_path = &ref_base_info.owner_package_path;
-            } else {
-                if path_components.is_empty() {
-                    return Some(ref_base_info.package_ref.clone());
-                } else {
-                    path_components.push_front(&ref_base_info.package_ref);
-                    // let resolved_path = path_components.join("/"); - join() doesn't exist for &String, so we need to do it manually
-                    let mut resolved_path = String::new();
-                    for component in path_components {
-                        resolved_path.push_str(component);
-                        resolved_path.push('/');
-                    }
-                    resolved_path.pop(); // remove the trailing '/'
-                    return Some(resolved_path);
-                }
-            }
-        }
+        model.resolve_reference_base_internal(base, ref_package_path)
     }
 
     pub(crate) fn fix_reference_base(
@@ -1287,17 +1285,57 @@ impl AutosarModelRaw {
     pub(crate) fn wrap(self) -> AutosarModel {
         AutosarModel(Arc::new(RwLock::new(self)))
     }
+
+    fn resolve_reference_base_internal(&self, base: &str, ref_package_path: &str) -> Option<String> {
+        let mut current_base = base;
+        let mut path_components = VecDeque::with_capacity(0);
+        let mut ref_package_path = ref_package_path;
+        loop {
+            // get (potentially) a list of reference bases that all have the requested base label
+            let ref_base_info_list = self.reference_bases.get(current_base)?;
+            // select the most applicable reference base from the list based on the owner_package_path (longest prefix match)
+            let ref_base_info = ref_base_info_list
+                .iter()
+                .filter(|info| ref_package_path.starts_with(&info.owner_package_path))
+                .max_by_key(|info| info.owner_package_path.len())?;
+
+            // base is relative to a package, so the path components of the package need to be added to the path
+            if let Some(package_ref_base) = &ref_base_info.package_ref_base {
+                // the reference base uses (at least) another reference base as its own base, so we
+                // loop and build up the path components until we reach a reference base that is absolute
+                path_components.push_front(&ref_base_info.package_ref);
+                current_base = package_ref_base;
+                ref_package_path = &ref_base_info.owner_package_path;
+            } else {
+                if path_components.is_empty() {
+                    return Some(ref_base_info.package_ref.clone());
+                } else {
+                    path_components.push_front(&ref_base_info.package_ref);
+                    // let resolved_path = path_components.join("/"); - join() doesn't exist for &String, so we need to do it manually
+                    let mut resolved_path = String::new();
+                    for component in path_components {
+                        resolved_path.push_str(component);
+                        resolved_path.push('/');
+                    }
+                    resolved_path.pop(); // remove the trailing '/'
+                    return Some(resolved_path);
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for AutosarModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // the file list mutex must not be locked while the model lock is held, so the list is cloned first
+        let files = self.file_list().lock().clone();
         let model = self.0.read();
         // instead of the usual f.debug_struct().field().field() ...
         // this is disassembled here, in order to hold self.0.lock() as briefly as possible
         let rootelem = model.root_element.clone();
         let mut dbgstruct = f.debug_struct("AutosarModel");
         dbgstruct.field("root_element", &rootelem);
-        dbgstruct.field("files", &model.files);
+        dbgstruct.field("files", &files);
         dbgstruct.field("identifiables", &model.identifiables);
         dbgstruct.field("reference_origins", &model.reference_origins);
         dbgstruct.field("relative_reference_origins", &model.relative_reference_origins);
@@ -1351,6 +1389,45 @@ mod test {
         // error: duplicate file name
         let file = model.create_file("test", AutosarVersion::Autosar_00050);
         assert!(file.is_err());
+    }
+
+    #[test]
+    fn concurrent_load_buffer() {
+        fn make_buf(pkg: &str) -> Vec<u8> {
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+            <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>{pkg}</SHORT-NAME></AR-PACKAGE></AR-PACKAGES>
+            </AUTOSAR>"#
+            )
+            .into_bytes()
+        }
+        // two concurrent load_buffer calls into an empty model must not interleave;
+        // without serialization one of the two element trees could be silently lost
+        for _ in 0..100 {
+            let model = AutosarModel::new();
+            let (m1, m2) = (model.clone(), model.clone());
+            let t1 = std::thread::spawn(move || m1.load_buffer(&make_buf("PkgA"), "file1.arxml", true).is_ok());
+            let t2 = std::thread::spawn(move || m2.load_buffer(&make_buf("PkgB"), "file2.arxml", true).is_ok());
+            assert!(t1.join().unwrap());
+            assert!(t2.join().unwrap());
+            assert_eq!(model.files().count(), 2);
+            assert!(model.get_element_by_path("/PkgA").is_some());
+            assert!(model.get_element_by_path("/PkgB").is_some());
+        }
+
+        // two concurrent loads of the same filename: exactly one of them must succeed,
+        // even though the duplicate check before parsing cannot see the other load yet
+        for _ in 0..100 {
+            let model = AutosarModel::new();
+            let (m1, m2) = (model.clone(), model.clone());
+            let t1 = std::thread::spawn(move || m1.load_buffer(&make_buf("PkgA"), "file1.arxml", true).is_ok());
+            let t2 = std::thread::spawn(move || m2.load_buffer(&make_buf("PkgB"), "file1.arxml", true).is_ok());
+            let ok1 = t1.join().unwrap();
+            let ok2 = t2.join().unwrap();
+            assert!(ok1 != ok2, "exactly one of the two loads must succeed");
+            assert_eq!(model.files().count(), 1);
+        }
     }
 
     #[test]

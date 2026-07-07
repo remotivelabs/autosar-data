@@ -138,7 +138,11 @@ pub(crate) struct WeakAutosarModel(Weak<RwLock<AutosarModelRaw>>);
 /// In addition, this top-level structure provides caching of Autosar paths, to allow quick resolution of cross-references.
 pub(crate) struct AutosarModelRaw {
     root_element: Element,
-    files: Vec<ArxmlFile>,
+    /// The list of files making up the model.
+    /// It has its own lock, because all operations that modify the set of files (`load_buffer`,
+    /// `create_file`, `remove_file`) hold this lock across multiple acquisitions of the model
+    /// lock.
+    files: Arc<parking_lot::Mutex<Vec<ArxmlFile>>>,
     /// `identifiables` is a `HashMap` of all named elements, needed to resolve references without doing a full search.
     identifiables: FxIndexMap<String, WeakElement>,
     /// `reference_origins` is a `HashMap` of all referencing elements.

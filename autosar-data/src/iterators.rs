@@ -18,9 +18,10 @@ impl Iterator for ArxmlFileIterator {
     type Item = ArxmlFile;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let model = self.data.0.read();
-        if self.index < model.files.len() {
-            let result = model.files[self.index].clone();
+        let file_list = self.data.file_list();
+        let locked_file_list = file_list.lock();
+        if self.index < locked_file_list.len() {
+            let result = locked_file_list[self.index].clone();
             self.index += 1;
             return Some(result);
         }
