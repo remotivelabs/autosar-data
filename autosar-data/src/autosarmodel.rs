@@ -313,6 +313,12 @@ impl AutosarModel {
         let mut elements_a_only = Vec::<Element>::new();
         let mut elements_b_only = Vec::<(Element, usize)>::new();
         let mut elements_merge = Vec::<(Element, Element)>::new();
+        // lazily built lookup maps over the children of parent_b, and the set of b-elements
+        // already consumed by a MergeUnequal match. Linear searches for each element would
+        // make the merge quadratic in the number of sub elements
+        let mut b_item_name_map: Option<HashMap<(ElementName, Option<String>), Element>> = None;
+        let mut b_defref_map: Option<HashMap<(ElementName, Option<String>), Element>> = None;
+        let mut merged_b_elements: HashSet<WeakElement> = HashSet::new();
         let min_ver_a = files
             .iter()
             .filter_map(|weak| weak.upgrade().map(|f| f.version()))
@@ -325,9 +331,9 @@ impl AutosarModel {
         while let (Some((pos_a, elem_a)), Some(elem_b)) = (&item_a, &item_b) {
             let merge_action = if elem_a.element_name() == elem_b.element_name() {
                 if elem_a.is_identifiable() {
-                    Self::calc_identifiables_merge(parent_a, parent_b, elem_a, elem_b, splitable)?
+                    Self::calc_identifiables_merge(parent_a, parent_b, elem_a, elem_b, splitable, &mut b_item_name_map)?
                 } else {
-                    Self::calc_element_merge(parent_b, elem_a, elem_b)
+                    Self::calc_element_merge(parent_b, elem_a, elem_b, &mut b_defref_map)
                 }
             } else {
                 // a and b are different kinds of elements. This is only allowed if parent is splittable
@@ -359,6 +365,7 @@ impl AutosarModel {
                     item_b = iter_b.next();
                 }
                 MergeAction::MergeUnequal(other_b) => {
+                    merged_b_elements.insert(other_b.downgrade());
                     elements_merge.push((elem_a.clone(), other_b));
                     item_a = iter_a.next();
                 }
@@ -367,7 +374,7 @@ impl AutosarModel {
                     item_a = iter_a.next();
                 }
                 MergeAction::BOnly(position) => {
-                    if !elements_merge.iter().any(|(_, merge_b)| merge_b == elem_b) {
+                    if !merged_b_elements.contains(&elem_b.downgrade()) {
                         elements_b_only.push((elem_b.clone(), position));
                     }
                     item_b = iter_b.next();
@@ -384,11 +391,11 @@ impl AutosarModel {
         }
         if let Some(elem_b) = item_b {
             let elem_count = parent_a.0.read().content.len();
-            if !elements_merge.iter().any(|(_, merge_b)| merge_b == &elem_b) {
+            if !merged_b_elements.contains(&elem_b.downgrade()) {
                 elements_b_only.push((elem_b, elem_count));
             }
             for elem_b in iter_b {
-                if !elements_merge.iter().any(|(_, merge_b)| merge_b == &elem_b) {
+                if !merged_b_elements.contains(&elem_b.downgrade()) {
                     elements_b_only.push((elem_b, elem_count));
                 }
             }
@@ -421,6 +428,7 @@ impl AutosarModel {
         elem_a: &Element,
         elem_b: &Element,
         splitable: bool,
+        b_item_name_map: &mut Option<HashMap<(ElementName, Option<String>), Element>>,
     ) -> Result<MergeAction, AutosarDataError> {
         Ok(if elem_a.item_name() == elem_b.item_name() {
             // equal
@@ -428,13 +436,19 @@ impl AutosarModel {
             MergeAction::MergeEqual
         } else {
             // assume that the ordering on both sides is different
-            // find a match for a among the siblings of b
-            if let Some(sibling) = parent_b
-                .sub_elements()
-                .find(|e| e.element_name() == elem_a.element_name() && e.item_name() == elem_a.item_name())
-            {
+            // find a match for a among the siblings of b, using a lookup map that is built once
+            // per parent; a linear search for each element would make the merge quadratic
+            let map = b_item_name_map.get_or_insert_with(|| {
+                let mut map = HashMap::new();
+                for e in parent_b.sub_elements() {
+                    // or_insert: keep the first element for each key, like the linear search did
+                    map.entry((e.element_name(), e.item_name())).or_insert(e);
+                }
+                map
+            });
+            if let Some(sibling) = map.get(&(elem_a.element_name(), elem_a.item_name())) {
                 // matching item found
-                MergeAction::MergeUnequal(sibling)
+                MergeAction::MergeUnequal(sibling.clone())
             } else {
                 // element is unique in a
                 if splitable {
@@ -450,7 +464,12 @@ impl AutosarModel {
 
     // calculate how to merge two elements which are not identifiable
     // precondition: both elements have the same element_name
-    fn calc_element_merge(parent_b: &Element, elem_a: &Element, elem_b: &Element) -> MergeAction {
+    fn calc_element_merge(
+        parent_b: &Element,
+        elem_a: &Element,
+        elem_b: &Element,
+        b_defref_map: &mut Option<HashMap<(ElementName, Option<String>), Element>>,
+    ) -> MergeAction {
         // special case for BSW parameters - many elements used here don't have a SHORT-NAME, but they do have a DEFINITION-REF
         let defref_a = elem_a
             .get_sub_element(ElementName::DefinitionRef)
@@ -475,19 +494,24 @@ impl AutosarModel {
             }
         } else {
             // check if a sibling of elem_b has the same definiton-ref as elem_a
-            // this handles the case where the the elements on both sides are ordered differently
-            if let Some(sibling) = parent_b
-                .sub_elements()
-                .filter(|e| e.element_name() == elem_a.element_name())
-                .find(|e| {
-                    e.get_sub_element(ElementName::DefinitionRef)
+            // this handles the case where the the elements on both sides are ordered differently.
+            // The lookup map is built once per parent; a linear search for each element would
+            // make the merge quadratic
+            let map = b_defref_map.get_or_insert_with(|| {
+                let mut map = HashMap::new();
+                for e in parent_b.sub_elements() {
+                    let defref = e
+                        .get_sub_element(ElementName::DefinitionRef)
                         .and_then(|dr| dr.character_data())
-                        .and_then(|cdata| cdata.string_value())
-                        == defref_a
-                })
-            {
+                        .and_then(|cdata| cdata.string_value());
+                    // or_insert: keep the first element for each key, like the linear search did
+                    map.entry((e.element_name(), defref)).or_insert(e);
+                }
+                map
+            });
+            if let Some(sibling) = map.get(&(elem_a.element_name(), defref_a)) {
                 // a match for item_a exists
-                MergeAction::MergeUnequal(sibling)
+                MergeAction::MergeUnequal(sibling.clone())
             } else {
                 // element is unique in A
                 // This case only happens for BSW definition elements, and it appears that these always have a splittable parent
