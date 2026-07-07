@@ -230,6 +230,8 @@ impl ArxmlFile {
         model.0.write().set_version(self.0.read().version);
         model
             .root_element()
+            .0
+            .read()
             .serialize_internal(&mut outstring, 0, false, &Some(self.downgrade()));
 
         Ok(outstring)

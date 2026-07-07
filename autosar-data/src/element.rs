@@ -241,7 +241,12 @@ impl Element {
     ///  - [`AutosarDataError::ElementNotIdentifiable`]: The current element is not identifiable, so it has no Autosar path
     ///
     pub fn path(&self) -> Result<String, AutosarDataError> {
-        self.0.read().path()
+        // path() is frequently called on parent elements while a child lock is held,
+        // so a blocking read() here could deadlock
+        self.0
+            .try_read_for(std::time::Duration::from_millis(10))
+            .ok_or(AutosarDataError::ParentElementLocked)?
+            .path()
     }
 
     /// Get the package element containing the current element
@@ -283,7 +288,16 @@ impl Element {
                 match &element.parent {
                     ElementOrModel::Element(weak_parent) => {
                         let parent = weak_parent.upgrade().ok_or(AutosarDataError::ItemDeleted)?;
-                        if parent.element_name() == ElementName::ArPackage {
+                        // avoid deadlocking if the parent is locked, because we're already holding a child lock here
+                        let parent_name = {
+                            let parent_lock = parent
+                                .0
+                                .try_read_for(std::time::Duration::from_millis(10))
+                                .ok_or(AutosarDataError::ParentElementLocked)?;
+                            parent_lock.element_name()
+                        };
+
+                        if parent_name == ElementName::ArPackage {
                             return Ok(Some(parent));
                         }
                         parent
@@ -356,13 +370,7 @@ impl Element {
     /// ```
     #[must_use]
     pub fn content_type(&self) -> ContentType {
-        match self.elemtype().content_mode() {
-            ContentMode::Sequence => ContentType::Elements,
-            ContentMode::Choice => ContentType::Elements,
-            ContentMode::Bag => ContentType::Elements,
-            ContentMode::Characters => ContentType::CharacterData,
-            ContentMode::Mixed => ContentType::Mixed,
-        }
+        self.elemtype().content_mode().into()
     }
 
     /// Create a sub element at a suitable insertion position
@@ -908,10 +916,7 @@ impl Element {
         let target_string = if let Some(base_label) = base_label {
             // a relative reference can only be resolved if the reference element is inside a package;
             // this is not always the case, e.g. references inside AUTOSAR > ADMIN-DATA are outside any package
-            let ref_package_path = self
-                .package()?
-                .ok_or(AutosarDataError::InvalidReferenceBase)?
-                .path()?;
+            let ref_package_path = self.package()?.ok_or(AutosarDataError::InvalidReferenceBase)?.path()?;
             let base_path = model
                 .resolve_reference_base(base_label, &ref_package_path)
                 .ok_or(AutosarDataError::InvalidReferenceBase)?;
@@ -927,6 +932,25 @@ impl Element {
         };
 
         let version = self.min_version()?;
+
+        // if this is the PACKAGE-REF of a REFERENCE-BASE, then the reference base cache in the model must be
+        // updated. The required info must be gathered before locking self: locking the parent while holding
+        // the element's own write lock could deadlock. Errors are propagated, so that the cache update
+        // cannot be skipped silently.
+        let reference_base_info = if self.element_name() == ElementName::PackageRef
+            && let Some(parent) = self.parent()?
+            && parent.element_name() == ElementName::ReferenceBase
+            && let Some(label) = parent
+                .get_sub_element(ElementName::ShortLabel)
+                .and_then(|e| e.character_data())
+                .and_then(|c| c.string_value())
+            && let Some(package) = parent.package()?
+        {
+            Some((label, package.path()?))
+        } else {
+            None
+        };
+
         let mut element = self.0.write();
         // set the DEST attribute first - this could fail if the target element has the wrong type
         if element
@@ -956,16 +980,7 @@ impl Element {
         }
 
         // if this is the PackageRef of a ReferenceBase, then we need to update the ReferenceBase index in the model
-        if element.element_name() == ElementName::PackageRef
-            && let Ok(Some(parent)) = element.parent()
-            && parent.element_name() == ElementName::ReferenceBase
-            && let Some(label) = parent
-                .get_sub_element(ElementName::ShortLabel)
-                .and_then(|e| e.character_data())
-                .and_then(|c| c.string_value())
-            && let Ok(Some(package)) = parent.package()
-            && let Ok(owner_package_path) = package.path()
-        {
+        if let Some((label, owner_package_path)) = reference_base_info {
             model.fix_reference_base(
                 Some(label.clone()),
                 label,
@@ -1040,10 +1055,7 @@ impl Element {
                 {
                     // a relative reference can only be resolved if the reference element is inside a package;
                     // this is not always the case, e.g. references inside AUTOSAR > ADMIN-DATA are outside any package
-                    let ref_package_path = self
-                        .package()?
-                        .ok_or(AutosarDataError::InvalidReference)?
-                        .path()?;
+                    let ref_package_path = self.package()?.ok_or(AutosarDataError::InvalidReference)?.path()?;
                     let reference_base = model
                         .resolve_reference_base(&base_label, &ref_package_path)
                         .ok_or(AutosarDataError::InvalidReference)?;
@@ -1891,119 +1903,9 @@ impl Element {
     pub fn serialize(&self) -> String {
         let mut outstring = String::new();
 
-        self.serialize_internal(&mut outstring, 0, false, &None);
+        self.0.read().serialize_internal(&mut outstring, 0, false, &None);
 
         outstring
-    }
-
-    pub(crate) fn serialize_internal(
-        &self,
-        outstring: &mut String,
-        indent: usize,
-        inline: bool,
-        for_file: &Option<WeakArxmlFile>,
-    ) {
-        let element = self.0.read();
-        let element_name = element.elemname.to_str();
-
-        if let Some(comment) = &self.0.read().comment {
-            // put the comment on a separate line
-            if !inline {
-                Self::serialize_newline_indent(outstring, indent);
-            }
-            outstring.push_str("<!--");
-            outstring.push_str(comment);
-            outstring.push_str("-->");
-        }
-
-        // write the opening tag on a new line and indent it
-        if !inline {
-            Self::serialize_newline_indent(outstring, indent);
-        }
-
-        if !element.content.is_empty() {
-            outstring.push('<');
-            outstring.push_str(element_name);
-            self.serialize_attributes(outstring);
-            outstring.push('>');
-
-            match self.content_type() {
-                ContentType::Elements => {
-                    // serialize each sub-element
-                    for subelem in self.sub_elements() {
-                        if for_file.is_none()
-                            || subelem.0.read().file_membership.is_empty()
-                            || subelem.0.read().file_membership.contains(for_file.as_ref().unwrap())
-                        {
-                            subelem.serialize_internal(outstring, indent + 1, false, for_file);
-                        }
-                    }
-                    // put the closing tag on a new line and indent it
-                    Self::serialize_newline_indent(outstring, indent);
-                    outstring.push_str("</");
-                    outstring.push_str(element_name);
-                    outstring.push('>');
-                }
-                ContentType::CharacterData => {
-                    // write the character data on the same line as the opening tag
-                    if let Some(ElementContent::CharacterData(chardata)) = element.content.first() {
-                        chardata.serialize_internal(outstring);
-                    }
-
-                    // write the closing tag on the same line
-                    outstring.push_str("</");
-                    outstring.push_str(element_name);
-                    outstring.push('>');
-                }
-                ContentType::Mixed => {
-                    for item in self.content() {
-                        match item {
-                            ElementContent::Element(subelem) => {
-                                if for_file.is_none()
-                                    || subelem.0.read().file_membership.is_empty()
-                                    || subelem.0.read().file_membership.contains(for_file.as_ref().unwrap())
-                                {
-                                    subelem.serialize_internal(outstring, indent + 1, true, for_file);
-                                }
-                            }
-                            ElementContent::CharacterData(chardata) => {
-                                chardata.serialize_internal(outstring);
-                            }
-                        }
-                    }
-                    // write the closing tag on the same line
-                    outstring.push_str("</");
-                    outstring.push_str(element_name);
-                    outstring.push('>');
-                }
-            }
-        } else {
-            outstring.push('<');
-            outstring.push_str(element_name);
-            self.serialize_attributes(outstring);
-            outstring.push('/');
-            outstring.push('>');
-        }
-    }
-
-    fn serialize_newline_indent(outstring: &mut String, indent: usize) {
-        outstring.push('\n');
-        for _ in 0..indent {
-            outstring.push_str("  ");
-        }
-    }
-
-    fn serialize_attributes(&self, outstring: &mut String) {
-        let element = self.0.read();
-        if !element.attributes.is_empty() {
-            for attribute in &element.attributes {
-                outstring.push(' ');
-                outstring.push_str(attribute.attrname.to_str());
-                outstring.push_str("=\"");
-                attribute.content.serialize_internal(outstring);
-                outstring.push('"');
-            }
-        }
     }
 
     pub(crate) fn elemtype(&self) -> ElementType {
@@ -4046,7 +3948,7 @@ mod test {
         el_autosar.set_comment(Some("comment".to_string()));
 
         let mut outstring = String::from(r#"<?xml version="1.0" encoding="utf-8"?>"#);
-        el_autosar.serialize_internal(&mut outstring, 0, false, &None);
+        el_autosar.0.read().serialize_internal(&mut outstring, 0, false, &None);
 
         assert_eq!(FILEBUF, outstring);
     }

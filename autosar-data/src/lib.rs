@@ -594,6 +594,19 @@ impl Ord for Attribute {
     }
 }
 
+/// Convert a ContentMode (specification) to a ContentType (runtime)
+impl From<ContentMode> for ContentType {
+    fn from(mode: ContentMode) -> Self {
+        match mode {
+            ContentMode::Sequence => ContentType::Elements,
+            ContentMode::Choice => ContentType::Elements,
+            ContentMode::Bag => ContentType::Elements,
+            ContentMode::Characters => ContentType::CharacterData,
+            ContentMode::Mixed => ContentType::Mixed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::{error::Error, io::Write, path::PathBuf};
