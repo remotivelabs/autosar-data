@@ -212,6 +212,7 @@ impl AutosarModel {
         let mut data = self.0.write();
         // import identifiables from the parser, check for conflicts with existing data
         data.identifiables.reserve(parser.identifiables.len());
+        let mut overlap_path = None;
         for (key, value) in parser.identifiables {
             // the same identifiables can be present in multiple files
             // in this case we only keep the first one
@@ -221,14 +222,18 @@ impl AutosarModel {
                     && existing_element.element_name() != new_element.element_name()
                 {
                     // referenced element is different on both sides
-                    return Err(AutosarDataError::OverlappingDataError {
-                        filename,
-                        path: new_element.xml_path(),
-                    });
+                    overlap_path = Some(new_element.xml_path());
+                    break;
                 }
             } else {
                 data.identifiables.insert(key, value);
             }
+        }
+        if let Some(path) = overlap_path {
+            // undo the partial merge of the new file
+            drop(data);
+            let _ = self.root_element().remove_from_file(&arxml_file);
+            return Err(AutosarDataError::OverlappingDataError { filename, path });
         }
 
         // import references from the parser
