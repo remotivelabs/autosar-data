@@ -47,7 +47,7 @@
 //!
 //! It is not possible to directly convert between [`ElementName`]s and [`ElementType`]s, since this is an n:m mapping.
 //! If the content of two differently named elements is structurally identical, then they have the same [`ElementType`];
-//! on the other side there are several elements that have different content depending in the context in which they appear.
+//! on the other side there are several elements that have different content depending on the context in which they appear.
 //!
 //! ## Example
 //!
@@ -146,7 +146,7 @@ pub enum CharacterDataSpec {
         /// If a `max_length` is given, then it restricts the length (in bytes).
         max_length: Option<usize>,
     },
-    /// An arbitrary string; if preserve whitepace is set, then whitespace should be preserved during parsing (see the XML standard)
+    /// An arbitrary string; if preserve whitespace is set, then whitespace should be preserved during parsing (see the XML standard)
     String {
         preserve_whitespace: bool,
         max_length: Option<usize>,
@@ -159,7 +159,7 @@ pub enum CharacterDataSpec {
 pub struct AttributeSpec {
     /// data type of the attribute content
     pub spec: &'static CharacterDataSpec,
-    /// is the attribute required to be present in it's containing element
+    /// is the attribute required to be present in its containing element
     pub required: bool,
     /// in which autosar version(s) is this attribute valid. This field is a bitmask.
     pub version: u32,
@@ -286,11 +286,11 @@ impl ElementType {
 
     /// get the multiplicity of a sub element within the current `ElementType`
     ///
-    /// The sub element is identified by an indx list, as returned by `find_sub_element()`
+    /// The sub element is identified by an index list, as returned by `find_sub_element()`
     #[must_use]
     pub fn get_sub_element_multiplicity(&self, element_indices: &[usize]) -> Option<ElementMultiplicity> {
         match self.get_sub_element_spec(element_indices) {
-            Some((SubElement::Element(definiton_id), _)) => Some(ELEMENTS[*definiton_id as usize].multiplicity),
+            Some((SubElement::Element(definition_id), _)) => Some(ELEMENTS[*definition_id as usize].multiplicity),
             _ => None,
         }
     }
@@ -322,7 +322,7 @@ impl ElementType {
     ///
     /// In almost all cases this is simple: there is a flat list of sub elements that either contains the `target_name` or not.
     /// The result in those simple cases is a vec with one entry which is the index of the element in the list.
-    /// There are a handfull of complicated situations though, where the list of sub elements contains groups of
+    /// There are a handful of complicated situations though, where the list of sub elements contains groups of
     /// elements that have a different `ContentMode` than the other elements.
     ///
     /// For example:
@@ -357,12 +357,12 @@ impl ElementType {
         let spec = ElementType::get_sub_elements(etype);
         for (cur_pos, sub_element) in spec.iter().enumerate() {
             match sub_element {
-                SubElement::Element(definiton_id) => {
-                    let name = ELEMENTS[*definiton_id as usize].name;
+                SubElement::Element(definition_id) => {
+                    let name = ELEMENTS[*definition_id as usize].name;
                     let ver_info_start = ElementType::get_sub_element_ver(etype);
                     let version_mask = VERSION_INFO[ver_info_start + cur_pos];
                     if (name == target_name) && (version & version_mask != 0) {
-                        return Some((ElementType::new(*definiton_id), vec![cur_pos]));
+                        return Some((ElementType::new(*definition_id), vec![cur_pos]));
                     }
                 }
                 SubElement::Group(groupid) => {
@@ -378,7 +378,7 @@ impl ElementType {
         None
     }
 
-    /// find the commmon group of two subelements of the current `ElementType`
+    /// find the common group of two subelements of the current `ElementType`
     ///
     /// The subelements are identified by their index lists, returned by `find_sub_element`().
     /// Returns None if either of the index lists is not valid for the current `ElementType`.

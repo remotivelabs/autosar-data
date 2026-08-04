@@ -14,7 +14,7 @@ both separately and in projects consisting of multiple files.
 - non-strict mode so that invalid but structurally sound data can be loaded
 - various element operations to modify and create sub-elements, data and attributes
 - support for Autosar paths and cross references
-- all operations are thread safe, e.g. it is possible to load mutliple files on separate threads
+- all operations are thread safe, e.g. it is possible to load multiple files on separate threads
 - supports Autosar version 4.0.1 and up.
 
 ## Example
@@ -68,7 +68,7 @@ pdu_element.remove_attribute(AttributeName::Uuid);
 
 ## Example Programs
 
-Two complete example programs can be found in the examples directory of the source repostitory. They are:
+Two complete example programs can be found in the examples directory of the source repository. They are:
 
 - businfo, which extracts information about bus settings, frames, pdus and signals from an autosar ECU extract
-- generate_files, which for each Autosar version generates an arxml file containing a least one instance of every specified element
+- generate_files, which for each Autosar version generates an arxml file containing at least one instance of every specified element

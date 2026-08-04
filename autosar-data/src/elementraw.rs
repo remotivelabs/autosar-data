@@ -988,7 +988,7 @@ impl ElementRaw {
         }
 
         if let Some((_, new_element_indices)) = elemtype.find_sub_element(element_name, version as u32) {
-            // element_name is a valid sub-element according to the specification; new_element_inidices describes the element grouping and ordering
+            // element_name is a valid sub-element according to the specification; new_element_indices describes the element grouping and ordering
 
             // Optimization: No need to check in detail because ContentMode::Bag
             // and ContentMode::mixed allow any number of elements in any order.
@@ -1042,7 +1042,7 @@ impl ElementRaw {
                                 }
                                 std::cmp::Ordering::Greater => {
                                     // new element is greater (i.e. later in the sequence) than the current one
-                                    // the erliest possible insert position is aftet the current element
+                                    // the earliest possible insert position is after the current element
                                     start_pos = idx + 1;
                                     end_pos = idx + 1;
                                 }
@@ -1101,7 +1101,7 @@ impl ElementRaw {
 
     /// remove the sub element `sub_element`
     ///
-    /// The `sub_element` will be unlinked from the hierarchy of elements. All of the sub-sub-elements nested under the removed element will also be recusively removed.
+    /// The `sub_element` will be unlinked from the hierarchy of elements. All of the sub-sub-elements nested under the removed element will also be recursively removed.
     /// Since all elements are reference counted, they might not be deallocated immediately, however they do become invalid and unusable immediately.
     pub(crate) fn remove_sub_element(
         &mut self,

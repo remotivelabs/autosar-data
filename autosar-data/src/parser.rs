@@ -25,7 +25,7 @@ pub enum ArxmlParserError {
     InvalidArxmlFileHeader,
 
     /// An XML file header was unexpectedly found inside the ARXML data
-    #[error("Unexpeded XML file header found inside ARXML data")]
+    #[error("Unexpected XML file header found inside ARXML data")]
     UnexpectedXmlFileHeader {
         /// The element that was open when the unexpected XML file header was found
         element: ElementName,
@@ -125,7 +125,7 @@ pub enum ArxmlParserError {
         sub_element: ElementName,
     },
 
-    /// An attribute value yould not be parsed
+    /// An attribute value could not be parsed
     #[error("Could not parse the attribute text \"{attribute_text}\" in element {element}")]
     AttributeValueError {
         /// The element where the error occurred
@@ -660,7 +660,7 @@ impl<'a> ArxmlParser<'a> {
             match mode {
                 ContentMode::Sequence => {
                     // We could check if the elements are in the specified order.
-                    // Unfortunaltely the tool used by the Autosar organisation to derive the xsd files from the meta model seems to be buggy.
+                    // Unfortunately the tool used by the Autosar organisation to derive the xsd files from the meta model seems to be buggy.
                     // For example, VARIATION-POINT should always be last according to the meta model, but some of the xsd files do not place it there.
                     // Since other tools seem to skip this check, lets also ignore ordering.
                 }
@@ -715,7 +715,7 @@ impl<'a> ArxmlParser<'a> {
         attributes_text: &[u8],
     ) -> Result<SmallVec<[Attribute; 1]>, AutosarDataError> {
         let mut attributes = SmallVec::new();
-        // attributes_text is a byte string containig all the attributes of an element
+        // attributes_text is a byte string containing all the attributes of an element
         // for example: xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_4-2-2.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         let startpos = attributes_text
             .iter()
@@ -852,7 +852,7 @@ impl<'a> ArxmlParser<'a> {
                         regex: (*regex).to_string(),
                     })?;
                 }
-                // text with regex pattern validation doesn't need unescaping - none of the regexes will allow any of the the escaped chars
+                // text with regex pattern validation doesn't need unescaping - none of the regexes will allow any of the escaped chars
                 match std::str::from_utf8(trimmed_input) {
                     Ok(utf8string) => Ok(CharacterData::String(utf8string.to_owned())),
                     Err(err) => {

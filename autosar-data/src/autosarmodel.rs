@@ -499,7 +499,7 @@ impl AutosarModel {
             }
         } else {
             // check if a sibling of elem_b has the same definiton-ref as elem_a
-            // this handles the case where the the elements on both sides are ordered differently.
+            // this handles the case where the elements on both sides are ordered differently.
             // The lookup map is built once per parent; a linear search for each element would
             // make the merge quadratic
             let map = b_defref_map.get_or_insert_with(|| {

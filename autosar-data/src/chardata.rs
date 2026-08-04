@@ -148,7 +148,7 @@ impl CharacterData {
 
     /// Get the contained unsigned integer
     ///
-    /// Returns the string if the content is a string, or None otherwise
+    /// Returns the value if the content is an unsigned integer, or None otherwise
     #[must_use]
     pub fn unsigned_integer_value(&self) -> Option<u64> {
         if let CharacterData::UnsignedInteger(uintval) = self {
@@ -170,7 +170,7 @@ impl CharacterData {
         }
     }
 
-    /// parse the stored charcter data value as an integer
+    /// parse the stored character data value as an integer
     ///
     /// Many numbers are stored as strings in order to allow hexadecimal, octal, and binary encoding.
     /// This function handles the conversion from text to integer.

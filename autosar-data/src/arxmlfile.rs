@@ -242,7 +242,7 @@ impl ArxmlFile {
     /// Some tools set headers that include the standalone attribute.
     /// This attribute appears to be meaningless for arxml files.
     ///
-    /// It is preserved nontheless and can be retrieved with this function.
+    /// It is preserved nonetheless and can be retrieved with this function.
     ///
     /// # Example
     ///

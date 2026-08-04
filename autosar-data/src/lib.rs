@@ -71,7 +71,7 @@
 //! Two complete example programs can be found in the examples directory of the source repository. They are:
 //!
 //!  - businfo, which extracts information about bus settings, frames, pdus and signals from an autosar ECU extract
-//!  - `generate_files`, which for each Autosar version generates an arxml file containing a least one instance of every specified element
+//!  - `generate_files`, which for each Autosar version generates an arxml file containing at least one instance of every specified element
 //!
 
 #![warn(missing_docs)]
@@ -166,7 +166,7 @@ pub enum AutosarDataError {
         ioerror: std::io::Error,
     },
 
-    /// `IoErrorOpen`: an `IoError` that occurres while opening a file
+    /// `IoErrorOpen`: an `IoError` that occurs while opening a file
     #[error("Failed to open {}: {ioerror}", .filename.to_string_lossy())]
     IoErrorOpen {
         /// The filename that caused the error
@@ -193,7 +193,7 @@ pub enum AutosarDataError {
         filename: PathBuf,
     },
 
-    /// `LexerError`: An error originating in the lexer, such as unclodes strings, mismatched '<' and '>', etc
+    /// `LexerError`: An error originating in the lexer, such as unclosed strings, mismatched '<' and '>', etc
     #[error("Failed to tokenize {} on line {line}: {source}", .filename.to_string_lossy())]
     LexerError {
         /// The filename that caused the error
@@ -335,7 +335,7 @@ pub enum AutosarDataError {
     #[error("Cannot create a copy that includes the destination")]
     ForbiddenCopyOfParent,
 
-    /// A parent element is currently locked by a different operation. The operation wa aborted to avoid a deadlock.
+    /// A parent element is currently locked by a different operation. The operation was aborted to avoid a deadlock.
     #[error("A parent element is currently locked by a different operation")]
     ParentElementLocked,
 

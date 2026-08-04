@@ -161,7 +161,7 @@ impl ElementsDfsIterator {
     }
 
     pub fn next_sibling(&mut self) -> Option<(usize, Element)> {
-        // when an element has bee returned, next always immediatly sets up to show its sub-elements
+        // when an element has been returned, next always immediately sets up to show its sub-elements
         // to show a sibling instead we just need to discard the info related to the sub-element
         self.elements.pop();
         self.position.pop();

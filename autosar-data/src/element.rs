@@ -759,7 +759,7 @@ impl Element {
     /// Remove the sub element `sub_element`
     ///
     /// The `sub_element` will be unlinked from the hierarchy of elements.
-    /// All of the sub-sub-elements nested under the removed element will also be recusively removed.
+    /// All of the sub-sub-elements nested under the removed element will also be recursively removed.
     ///
     /// Since all elements are reference counted, they might not be deallocated immediately, however they do become invalid and unusable immediately.
     ///
@@ -800,7 +800,7 @@ impl Element {
     /// If multiple sub elements with the same ElementName exist, only the first one will be removed.
     ///
     /// A sub element with the given ElementName will be unlinked from the hierarchy of elements.
-    /// All of the sub-sub-elements nested under the removed element will also be recusively removed.
+    /// All of the sub-sub-elements nested under the removed element will also be recursively removed.
     ///
     /// This is a convenience function that is equivalent to calling `get_sub_element()` followed by `remove_sub_element()`.
     ///
