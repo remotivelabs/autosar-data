@@ -693,6 +693,10 @@ impl AutosarModel {
             if locked_file_list.is_empty() {
                 // no other files remain in the model, so it reverts to being empty
                 let mut locked_model = self.0.write();
+                // clear the parent ref of all sub elements in case other handles to them still exist
+                for elem in locked_model.root_element.sub_elements() {
+                    elem.set_parent(ElementOrModel::None);
+                }
                 locked_model.root_element.0.write().content.clear();
                 locked_model.root_element.set_file_membership(HashSet::new());
                 locked_model.identifiables.clear();
@@ -1788,7 +1792,7 @@ mod test {
         </AR-PACKAGE>
     </AR-PACKAGES>
 </AUTOSAR>"#
-                        .as_bytes();
+        .as_bytes();
 
         let model = AutosarModel::new();
         let (file, _) = model.load_buffer(FILEBUF, "test", true).unwrap();
