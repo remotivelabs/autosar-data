@@ -84,21 +84,37 @@ impl<'a> ArxmlLexer<'a> {
         (ArxmlEvent::Characters(text), all_whitespace)
     }
 
-    fn read_element_start(&mut self, endpos: usize) -> ArxmlEvent<'a> {
+    fn read_element_start(&mut self, mut endpos: usize) -> ArxmlEvent<'a> {
         debug_assert!(self.bufpos < self.buffer.len());
         debug_assert!(endpos > self.bufpos + 1);
         debug_assert!(self.buffer[self.bufpos] == b'<');
 
-        let (text, is_end) = if self.buffer[endpos - 1] == b'/' {
-            (&self.buffer[self.bufpos + 1..endpos - 1], true)
-        } else {
-            (&self.buffer[self.bufpos + 1..endpos], false)
-        };
+        // this loop runs at most twice: once with the '>' found by next(), and - if that '>'
+        // turned out to be part of an attribute value - once with the real end of the element
+        let (text, elemname, attributes, is_end) = loop {
+            let (text, is_end) = if self.buffer[endpos - 1] == b'/' {
+                (&self.buffer[self.bufpos + 1..endpos - 1], true)
+            } else {
+                (&self.buffer[self.bufpos + 1..endpos], false)
+            };
 
-        let (elemname, attributes) = if let Some(splitpos) = text.iter().position(u8::is_ascii_whitespace) {
-            (&text[..splitpos], &text[splitpos + 1..])
-        } else {
-            (text, &text[0..0])
+            let (elemname, attributes) = if let Some(splitpos) = text.iter().position(u8::is_ascii_whitespace) {
+                (&text[..splitpos], &text[splitpos + 1..])
+            } else {
+                (text, &text[0..0])
+            };
+
+            // xml permits an unescaped '>' inside a quoted attribute value, e.g. <FOO S="a > b">.
+            // Such a '>' terminated the search in next() too early, which shows up here as attribute
+            // text that ends in the middle of a quoted value.
+            let Some(quotechar) = unterminated_quote(attributes) else {
+                break (text, elemname, attributes, is_end);
+            };
+            let Some(real_endpos) = self.find_quoted_element_end(endpos, quotechar) else {
+                // The quoted value is not terminated, i.e. the input is not valid xml after all.
+                break (text, elemname, attributes, is_end);
+            };
+            endpos = real_endpos;
         };
 
         // this is a <element/>, so a EndElement event needs to be generated next
@@ -110,6 +126,31 @@ impl<'a> ArxmlLexer<'a> {
         self.line += count_lines(text);
         self.bufpos = endpos + 1;
         ArxmlEvent::BeginElement(elemname, attributes)
+    }
+
+    /// continue the search for the end of an element from inside a quoted attribute value
+    ///
+    /// Returns the position of the next '>' that is not inside a quoted attribute value,
+    /// or None if the element does not end in a way that is valid xml.
+    fn find_quoted_element_end(&self, startpos: usize, quotechar: u8) -> Option<usize> {
+        let mut quotechar = Some(quotechar);
+        for (idx, c) in self.buffer[startpos..].iter().enumerate() {
+            if *c == b'<' {
+                // '<' must be escaped everywhere in xml, so it can't be part of an attribute value.
+                // The element is simply malformed and the search should not run on into the following
+                // elements looking for a closing quote that doesn't exist.
+                return None;
+            } else if let Some(qc) = quotechar {
+                if *c == qc {
+                    quotechar = None;
+                }
+            } else if *c == b'>' {
+                return Some(startpos + idx);
+            } else if *c == b'"' || *c == b'\'' {
+                quotechar = Some(*c);
+            }
+        }
+        None
     }
 
     fn read_element_end(&mut self, endpos: usize) -> ArxmlEvent<'a> {
@@ -239,6 +280,8 @@ impl ArxmlLexer<'_> {
                         .iter()
                         .position(|c| *c == b'>')
                         .ok_or_else(|| self.error(ArxmlLexerError::IncompleteData))?;
+                    // endpos may be the position of a '>' that is part of an attribute value, but the
+                    // call to read_element_start() will check for that and continue the search if necessary.
                     let endpos = self.bufpos + findpos + 1;
 
                     if endpos == self.bufpos + 1 {
@@ -264,6 +307,8 @@ impl ArxmlLexer<'_> {
                             // second char is '!' -> parse a comment
                             // we found a '>' character, but comments are allowed to contain unquoted '<' and '>'
                             // this means we need to make sure the end is actually '-->', not just '>'
+                            // XML conformance note: the Autosar standard defines a subset of XML and forbids
+                            // CDATA and DOCTYPE sections, so those don't need to be handled here.
                             let mut comment_endpos = endpos;
                             while comment_endpos < self.buffer.len()
                                 && !self.buffer[comment_endpos - 2..].starts_with(b"-->")
@@ -303,6 +348,23 @@ impl ArxmlLexer<'_> {
             source: err,
         }
     }
+}
+
+/// check if the attribute text ends inside a quoted value
+///
+/// Returns the quote character of the unterminated value, or None if all quoted values are terminated.
+fn unterminated_quote(text: &[u8]) -> Option<u8> {
+    let mut quotechar = None;
+    for c in text {
+        if let Some(qc) = quotechar {
+            if *c == qc {
+                quotechar = None;
+            }
+        } else if *c == b'"' || *c == b'\'' {
+            quotechar = Some(*c);
+        }
+    }
+    quotechar
 }
 
 fn count_lines(text: &[u8]) -> usize {
@@ -417,6 +479,71 @@ mod test {
         let data = b"<!-- declarations for <head> & <body> -->";
         let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
         assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::Comment(_)))));
+    }
+
+    /// xml allows an unescaped '>' inside a quoted attribute value
+    #[test]
+    fn test_gt_in_attribute_value() {
+        // double quoted value containing '>'
+        let data = b"<element attr=\"a>b\">text</element>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, attrs))) if elem == b"element" && attrs == b"attr=\"a>b\"")
+        );
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::Characters(text))) if text == b"text"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::EndElement(elem))) if elem == b"element"));
+
+        // single quoted value containing '>' and '"'
+        let data = b"<element attr='a>\"b'>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, attrs))) if elem == b"element" && attrs == b"attr='a>\"b'")
+        );
+
+        // several attributes, only the last one contains '>'
+        let data = b"<element a=\"1\" b='2' c=\"3>4\" d=\"5\">";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, attrs))) if elem == b"element" && attrs == b"a=\"1\" b='2' c=\"3>4\" d=\"5\"")
+        );
+
+        // empty element, whose attribute value contains "/>"
+        let data = b"<element attr=\"a/>b\"/>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, attrs))) if elem == b"element" && attrs == b"attr=\"a/>b\"")
+        );
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::EndElement(elem))) if elem == b"element"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::EndOfFile))));
+
+        // a newline inside the attribute value is still counted
+        let data = b"<element attr=\"a>\nb\"><x>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(matches!(lexer.next(), Ok((1, ArxmlEvent::BeginElement(_, _)))));
+        assert!(matches!(lexer.next(), Ok((2, ArxmlEvent::BeginElement(elem, _))) if elem == b"x"));
+    }
+
+    /// an attribute value that is never terminated: the element text is truncated at the first '>',
+    /// so that the parser can report the error and the following elements are still parsed
+    #[test]
+    fn test_unterminated_attribute_value() {
+        // the search for the end of the value stops at the '<' of the next element
+        let data = b"<element attr=\"abc>text</element>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, attrs))) if elem == b"element" && attrs == b"attr=\"abc")
+        );
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::Characters(text))) if text == b"text"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::EndElement(elem))) if elem == b"element"));
+
+        // the search for the end of the value runs to the end of the input
+        let data = b"<element attr=\"abc>text";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, attrs))) if elem == b"element" && attrs == b"attr=\"abc")
+        );
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::Characters(text))) if text == b"text"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::EndOfFile))));
     }
 
     /// github issue #32 - extra spaces in the XML header should be tolerated

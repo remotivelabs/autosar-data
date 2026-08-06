@@ -1617,6 +1617,35 @@ mod test {
         assert!(parser.references.iter().any(|(refpath, _, _)| refpath == "Pdu"));
     }
 
+    const GT_IN_ATTRIBUTE_VALUE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES>
+            <AR-PACKAGE S="a > b">
+                <SHORT-NAME>x</SHORT-NAME>
+            </AR-PACKAGE>
+        </AR-PACKAGES>
+    </AUTOSAR>
+    "#;
+
+    #[test]
+    fn gt_in_attribute_value() {
+        // xml allows an unescaped '>' inside a quoted attribute value; the value must not be truncated
+        let mut parser = ArxmlParser::new(
+            PathBuf::from("test_buffer.arxml"),
+            GT_IN_ATTRIBUTE_VALUE.as_bytes(),
+            true,
+        );
+        let root = parser.parse_arxml().unwrap();
+        let package = root
+            .get_sub_element(ElementName::ArPackages)
+            .and_then(|pkgs| pkgs.get_sub_element(ElementName::ArPackage))
+            .unwrap();
+        assert_eq!(
+            package.attribute_value(AttributeName::S).unwrap(),
+            CharacterData::String("a > b".to_string())
+        );
+    }
+
     const EMPTY_CHARACTER_DATA: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
         <AR-PACKAGES>
