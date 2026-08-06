@@ -345,14 +345,12 @@ fn display_flexray_cluster(cluster_element: &Element) -> Option<()> {
     if let Some(proto_name) = fcc
         .get_sub_element(ElementName::ProtocolName)
         .and_then(|elem| elem.character_data())
-    {
-        if let Some(proto_ver) = fcc
+        && let Some(proto_ver) = fcc
             .get_sub_element(ElementName::ProtocolVersion)
             .and_then(|elem| elem.character_data())
         {
             println!("  Protocol: {proto_name} {proto_ver}");
         }
-    }
     if let Some(baudrate) = fcc
         .get_sub_element(ElementName::Baudrate)
         .and_then(|elem| elem.character_data())
@@ -766,8 +764,8 @@ fn display_isignal_ipdu(pdu: &Element, indent: usize) {
         .and_then(|elem| elem.get_sub_element(ElementName::TransmissionModeDeclaration))
         .and_then(|elem| elem.get_sub_element(ElementName::TransmissionModeTrueTiming))
     {
-        if let Some(cyclic_timing) = tx_mode_true_timing.get_sub_element(ElementName::CyclicTiming) {
-            if let Some(TimeRange { tolerance, value }) = cyclic_timing
+        if let Some(cyclic_timing) = tx_mode_true_timing.get_sub_element(ElementName::CyclicTiming)
+            && let Some(TimeRange { tolerance, value }) = cyclic_timing
                 .get_sub_element(ElementName::TimePeriod)
                 .and_then(|elem| get_time_range(&elem))
             {
@@ -797,7 +795,6 @@ fn display_isignal_ipdu(pdu: &Element, indent: usize) {
                     }
                 }
             }
-        }
         if let Some(event_timing) = tx_mode_true_timing.get_sub_element(ElementName::EventControlledTiming) {
             println!("{indentation}Event controlled timing:");
             if let Some(num_reps) = event_timing
@@ -807,8 +804,8 @@ fn display_isignal_ipdu(pdu: &Element, indent: usize) {
             {
                 println!("{indentation}  Number of repetitions: {num_reps}");
             }
-            if let Some(repetition_period) = event_timing.get_sub_element(ElementName::RepetitionPeriod) {
-                if let Some(TimeRange { tolerance, value }) = get_time_range(&repetition_period) {
+            if let Some(repetition_period) = event_timing.get_sub_element(ElementName::RepetitionPeriod)
+                && let Some(TimeRange { tolerance, value }) = get_time_range(&repetition_period) {
                     println!("          Repetition period: {value}");
                     if let Some(tol) = tolerance {
                         match tol {
@@ -821,7 +818,6 @@ fn display_isignal_ipdu(pdu: &Element, indent: usize) {
                         }
                     }
                 }
-            }
         }
     }
     let mut signals = FxHashMap::<String, (String, Option<i64>, Option<i64>)>::default();
@@ -872,7 +868,7 @@ fn display_isignal_ipdu(pdu: &Element, indent: usize) {
         } else {
             println!("{indentation}Signals (ungrouped):");
         }
-        remaining_signals.sort_by(|a, b| a.1.cmp(&b.1));
+        remaining_signals.sort_by_key(|a| a.1);
         for (name, start_pos, length) in remaining_signals {
             print!("{indentation}  {name}");
             if let Some(start_pos) = start_pos {
@@ -954,16 +950,15 @@ fn display_isignal_group(
             .sub_elements()
             .filter(|elem| elem.element_name() == ElementName::ISignalRef)
         {
-            if let Some(CharacterData::String(path)) = isignal_ref.character_data() {
-                if let Some(siginfo) = signals.get(&path) {
+            if let Some(CharacterData::String(path)) = isignal_ref.character_data()
+                && let Some(siginfo) = signals.get(&path) {
                     sig_group_signals.push(siginfo.clone());
                     signals.remove(&path);
                 }
-            }
         }
     }
     // sort and display the group signals
-    sig_group_signals.sort_by(|a, b| a.1.cmp(&b.1));
+    sig_group_signals.sort_by_key(|a| a.1);
     for (name, start_pos, length) in sig_group_signals {
         print!("{indentation}      {name}");
         if let Some(start_pos) = start_pos {
@@ -1060,8 +1055,7 @@ fn display_nm_pdu(pdu: &Element, indent: usize) {
     if let Some(mapping) = pdu
         .get_sub_element(ElementName::ISignalToIPduMappings)
         .and_then(|elem| elem.get_sub_element(ElementName::ISignalToIPduMapping))
-    {
-        if let Some(signal) = mapping
+        && let Some(signal) = mapping
             .get_sub_element(ElementName::ISignalRef)
             .and_then(|elem| elem.get_reference_target().ok())
         {
@@ -1083,7 +1077,6 @@ fn display_nm_pdu(pdu: &Element, indent: usize) {
             }
             println!();
         }
-    }
 }
 
 // <CONTAINER-I-PDU>
@@ -1248,11 +1241,10 @@ fn display_ethernet_channel(channel: &Element) -> Option<()> {
 // </PDU-TRIGGERINGS>
 fn display_ethernet_pdus(pdu_triggerings: &Element) -> Option<()> {
     for pdu_triggering in pdu_triggerings.sub_elements() {
-        if display_ethernet_pdu(&pdu_triggering).is_none() {
-            if let Ok(path) = pdu_triggering.path() {
+        if display_ethernet_pdu(&pdu_triggering).is_none()
+            && let Ok(path) = pdu_triggering.path() {
                 println!("!!! inconsistent ethernet PDU triggering: {path}");
             }
-        }
     }
     println!();
     Some(())

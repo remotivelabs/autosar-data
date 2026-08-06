@@ -612,6 +612,7 @@ mod test {
         let file_cloned = file.clone();
         assert_eq!(file, file_cloned);
         assert_eq!(format!("{file:#?}"), format!("{file_cloned:#?}"));
+        #[allow(clippy::mutable_key_type)]
         let mut hashset = HashSet::<ArxmlFile>::new();
         hashset.insert(file);
         let inserted = hashset.insert(file_cloned);

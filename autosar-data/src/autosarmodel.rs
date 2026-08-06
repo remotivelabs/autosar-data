@@ -2081,6 +2081,7 @@ mod test {
         let model_cloned = model.clone();
         assert_eq!(model, model_cloned);
         assert_eq!(format!("{model:#?}"), format!("{model_cloned:#?}"));
+        #[allow(clippy::mutable_key_type)]
         let mut hashset = HashSet::<AutosarModel>::new();
         hashset.insert(model);
         let inserted = hashset.insert(model_cloned);

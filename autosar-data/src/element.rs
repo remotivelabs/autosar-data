@@ -4385,6 +4385,7 @@ mod test {
         assert_eq!(weak1, weak2);
         assert_eq!(format!("{weak1:?}"), format!("{weak2:?}"));
 
+        #[allow(clippy::mutable_key_type)]
         let mut hs = HashSet::new();
         hs.insert(el_autosar);
         hs.insert(el_ar_packages);
