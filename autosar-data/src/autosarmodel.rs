@@ -1114,7 +1114,6 @@ impl AutosarModel {
                         }
                     }
                 } else {
-                    // This case should never happen, possibly panic?
                     // The strong ref count of target_elem can only go to zero if the element is removed,
                     // but remove_element() should also update data.identifiables and data.reference_origins.
                     broken_refs.extend(element_list.iter().cloned());
