@@ -722,8 +722,12 @@ impl<'a> ArxmlParser<'a> {
             .position(|c| !c.is_ascii_whitespace())
             .unwrap_or(0);
         let mut rem = &attributes_text[startpos..];
-        while let Some(equals_pos) = rem.iter().position(|c| *c == b'=') {
-            let attr_name_part = &rem[..equals_pos];
+        while let Some(mut equals_pos) = rem.iter().position(|c| *c == b'=') {
+            let attr_name_part = rem[..equals_pos].trim_ascii_end();
+            // skip whitespace after the equals sign
+            while let Some(c) = rem.get(equals_pos + 1) && c.is_ascii_whitespace() {
+                equals_pos += 1;
+            }
             if rem.len() - equals_pos < 3 {
                 // minimally the attribute name should be followed by an equals sign and two quotes (empty string)
                 break;
@@ -1871,5 +1875,13 @@ mod test {
             .parse_attribute_text(etype_arpackage, br#"  UUID="12345678"  T="2024-01-01""#)
             .unwrap();
         assert_eq!(value.len(), 2);
+
+        // two attributes with spaces around the '='
+        let value = parser
+            .parse_attribute_text(etype_arpackage, br#"  UUID = "12345678"  T = "2024-01-01""#)
+            .unwrap();
+        assert_eq!(value.len(), 2);
+        assert_eq!(value[0].attrname, AttributeName::Uuid);
+        assert_eq!(value[1].attrname, AttributeName::T);
     }
 }
