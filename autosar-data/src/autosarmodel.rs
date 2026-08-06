@@ -607,7 +607,9 @@ impl AutosarModel {
                             elem_a.set_file_membership(files);
                             // try to import elem_b as a new item instead
                             let dest = elem_a.position().unwrap_or_default() + 1;
-                            return Self::import_single_item(parent_a, elem_b, dest, new_file, version).map_err(|_| e);
+                            Self::import_single_item(parent_a, elem_b, dest, new_file, version).map_err(|_| e)?;
+                            // recovery succeeded: continue with the remaining elements
+                            continue;
                         }
                     }
 
@@ -1699,6 +1701,91 @@ mod test {
         model_b.sort();
         let model_b_txt = model_b.root_element().serialize();
         assert_eq!(model_a_txt, model_b_txt);
+    }
+
+    #[test]
+    fn data_merge_after_insertion_conflict() {
+        // Both files contain the same two ECUC parameter values, but the values of the
+        // first of these differ. Merging the two ECUC-NUMERICAL-PARAM-VALUE elements of
+        // /REF_A is not possible, because VALUE may only appear once in each of them.
+        // PARAMETER-VALUES is splittable, so the element from the second file is added
+        // as an additional sub element instead of merging it.
+        // After this recovery step, the remaining elements (here: /REF_B) must still be merged.
+        const FILEBUF1: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><ELEMENTS>
+          <ECUC-MODULE-CONFIGURATION-VALUES><SHORT-NAME>BswModule</SHORT-NAME><CONTAINERS><ECUC-CONTAINER-VALUE>
+            <SHORT-NAME>BswModuleValues</SHORT-NAME>
+            <PARAMETER-VALUES>
+              <ECUC-NUMERICAL-PARAM-VALUE>
+                <DEFINITION-REF DEST="ECUC-BOOLEAN-PARAM-DEF">/REF_A</DEFINITION-REF>
+                <VALUE>1</VALUE>
+              </ECUC-NUMERICAL-PARAM-VALUE>
+              <ECUC-NUMERICAL-PARAM-VALUE>
+                <DEFINITION-REF DEST="ECUC-BOOLEAN-PARAM-DEF">/REF_B</DEFINITION-REF>
+              </ECUC-NUMERICAL-PARAM-VALUE>
+            </PARAMETER-VALUES>
+          </ECUC-CONTAINER-VALUE></CONTAINERS></ECUC-MODULE-CONFIGURATION-VALUES>
+        </ELEMENTS></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#.as_bytes();
+        const FILEBUF2: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><ELEMENTS>
+          <ECUC-MODULE-CONFIGURATION-VALUES><SHORT-NAME>BswModule</SHORT-NAME><CONTAINERS><ECUC-CONTAINER-VALUE>
+            <SHORT-NAME>BswModuleValues</SHORT-NAME>
+            <PARAMETER-VALUES>
+              <ECUC-NUMERICAL-PARAM-VALUE>
+                <DEFINITION-REF DEST="ECUC-BOOLEAN-PARAM-DEF">/REF_A</DEFINITION-REF>
+                <VALUE>2</VALUE>
+              </ECUC-NUMERICAL-PARAM-VALUE>
+              <ECUC-NUMERICAL-PARAM-VALUE>
+                <DEFINITION-REF DEST="ECUC-BOOLEAN-PARAM-DEF">/REF_B</DEFINITION-REF>
+                <VALUE>3</VALUE>
+              </ECUC-NUMERICAL-PARAM-VALUE>
+            </PARAMETER-VALUES>
+          </ECUC-CONTAINER-VALUE></CONTAINERS></ECUC-MODULE-CONFIGURATION-VALUES>
+        </ELEMENTS></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#.as_bytes();
+
+        // serialize each file on its own; merging must not change the content of either file
+        let single_model = AutosarModel::new();
+        let (single_file1, _) = single_model.load_buffer(FILEBUF1, "file1.arxml", true).unwrap();
+        let file1_txt = single_file1.serialize().unwrap();
+        let single_model = AutosarModel::new();
+        let (single_file2, _) = single_model.load_buffer(FILEBUF2, "file2.arxml", true).unwrap();
+        let file2_txt = single_file2.serialize().unwrap();
+
+        let model = AutosarModel::new();
+        let (file1, _) = model.load_buffer(FILEBUF1, "file1.arxml", true).unwrap();
+        let (file2, _) = model.load_buffer(FILEBUF2, "file2.arxml", true).unwrap();
+
+        let el_parameter_values = model
+            .get_element_by_path("/Pkg/BswModule/BswModuleValues")
+            .and_then(|bmv| bmv.get_sub_element(ElementName::ParameterValues))
+            .unwrap();
+        let params: Vec<Element> = el_parameter_values.sub_elements().collect();
+        // the parameter value of /REF_A could not be merged, so it exists twice: once for each file
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].file_membership().unwrap().1.len(), 1);
+        assert_eq!(params[1].file_membership().unwrap().1.len(), 1);
+
+        // the parameter value of /REF_B was merged: the VALUE from file2 was added to it
+        let el_value = params[2].get_sub_element(ElementName::Value).unwrap();
+        assert_eq!(el_value.character_data().unwrap().string_value().unwrap(), "3");
+        // the VALUE of /REF_B is only present in file2
+        let (local, fileset) = el_value.file_membership().unwrap();
+        assert!(local);
+        assert_eq!(fileset.len(), 1);
+        assert!(fileset.contains(&file2.downgrade()));
+
+        // the content of both files is unchanged by the merge
+        assert_eq!(file1.serialize().unwrap(), file1_txt);
+        assert_eq!(file2.serialize().unwrap(), file2_txt);
+
+        // load the files in the opposite order: the content of both files must still be unchanged
+        let model = AutosarModel::new();
+        let (file2, _) = model.load_buffer(FILEBUF2, "file2.arxml", true).unwrap();
+        let (file1, _) = model.load_buffer(FILEBUF1, "file1.arxml", true).unwrap();
+        assert_eq!(file1.serialize().unwrap(), file1_txt);
+        assert_eq!(file2.serialize().unwrap(), file2_txt);
     }
 
     #[test]

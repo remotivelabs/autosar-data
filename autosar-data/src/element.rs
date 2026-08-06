@@ -990,7 +990,7 @@ impl Element {
             );
         }
 
-        // do the update
+        // do the update - Note: The update is infallible in practice, since we've constructed a valid target string
         element.set_character_data(CharacterData::String(target_string), version)?;
         if let Some(base_label) = base_label {
             element.set_attribute_internal(
