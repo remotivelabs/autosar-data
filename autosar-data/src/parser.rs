@@ -12,8 +12,7 @@ use thiserror::Error;
 
 use crate::lexer::{ArxmlEvent, ArxmlLexer};
 use crate::{
-    Attribute, AutosarDataError, CharacterData, Element, ElementContent, ElementOrModel, ElementRaw, ReferenceBaseInfo,
-    WeakElement,
+    Attribute, AutosarDataError, CharacterData, Element, ElementContent, ElementOrModel, ElementRaw, WeakElement,
 };
 
 #[derive(Debug, Error, PartialEq)]
@@ -258,7 +257,6 @@ pub(crate) struct ArxmlParser<'a> {
     version_compatibility: u32,
     pub(crate) identifiables: Vec<(String, WeakElement)>,
     pub(crate) references: Vec<(String, WeakElement, Option<String>)>,
-    pub(crate) reference_bases: Vec<(String, ReferenceBaseInfo)>,
     pub(crate) warnings: Vec<AutosarDataError>,
     standalone: Option<bool>,
 }
@@ -275,7 +273,6 @@ impl<'a> ArxmlParser<'a> {
             version_compatibility: u32::MAX,
             identifiables: Vec::new(),
             references: Vec::new(),
-            reference_bases: Vec::new(),
             warnings: Vec::new(),
             standalone: None,
         }
@@ -566,39 +563,6 @@ impl<'a> ArxmlParser<'a> {
             })?;
         }
 
-        if element.elemname == ElementName::ReferenceBase {
-            let mut short_label = None;
-            let mut package_ref = None;
-            let mut package_ref_base = None;
-
-            for item in &element.content {
-                if let ElementContent::Element(sub_elem) = item {
-                    let sub_locked = sub_elem.0.read();
-                    if sub_locked.elemname == ElementName::ShortLabel {
-                        short_label = sub_locked.character_data().and_then(|cdata| cdata.string_value());
-                    } else if sub_locked.elemname == ElementName::PackageRef {
-                        package_ref = sub_locked.character_data().and_then(|cdata| cdata.string_value());
-                        package_ref_base = sub_locked
-                            .attribute_value(AttributeName::Base)
-                            .and_then(|cdata| cdata.string_value());
-                    }
-                }
-            }
-
-            if let (Some(short_label), Some(package_ref)) = (short_label, package_ref)
-                && !path.is_empty()
-            {
-                self.reference_bases.push((
-                    short_label,
-                    ReferenceBaseInfo {
-                        owner_package_path: path.as_ref().to_string(),
-                        package_ref,
-                        package_ref_base,
-                    },
-                ));
-            }
-        }
-
         Ok(wrapped_element.clone())
     }
 
@@ -725,7 +689,9 @@ impl<'a> ArxmlParser<'a> {
         while let Some(mut equals_pos) = rem.iter().position(|c| *c == b'=') {
             let attr_name_part = rem[..equals_pos].trim_ascii_end();
             // skip whitespace after the equals sign
-            while let Some(c) = rem.get(equals_pos + 1) && c.is_ascii_whitespace() {
+            while let Some(c) = rem.get(equals_pos + 1)
+                && c.is_ascii_whitespace()
+            {
                 equals_pos += 1;
             }
             if rem.len() - equals_pos < 3 {
@@ -1609,13 +1575,8 @@ mod test {
         let result = parser.parse_arxml();
         assert!(result.is_ok());
 
-        assert_eq!(parser.reference_bases.len(), 1);
-        let (base_label, base_info) = &parser.reference_bases[0];
-        assert_eq!(base_label, "default");
-        assert_eq!(base_info.package_ref, "/base");
-        assert_eq!(base_info.owner_package_path, "/base");
-        assert_eq!(base_info.package_ref_base, None);
-
+        // The parser only collects the references it encounters, as raw text: a relative reference can
+        // only be resolved once the whole tree exists, which is the model's job.
         assert_eq!(parser.references.len(), 2);
         assert!(parser.references.iter().any(|(refpath, _, _)| refpath == "/base"));
         assert!(parser.references.iter().any(|(refpath, _, _)| refpath == "Pdu"));

@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    hash::Hash,
-};
+use std::{collections::HashMap, hash::Hash};
 
 use crate::*;
 
@@ -12,6 +9,52 @@ enum MergeAction {
     MergeUnequal(Element),
     AOnly,
     BOnly(usize),
+}
+
+/// Replace `old_prefix` with `new_prefix` in `path`.
+///
+/// Returns `None` if `path` is neither `old_prefix` itself nor nested inside it. Unlike a plain
+/// `str::starts_with`, the prefix comparison respects the '/' path component boundaries, so
+/// "/package10/Elem" is not considered to be inside "/package1".
+pub(crate) fn replace_path_prefix(path: &str, old_prefix: &str, new_prefix: &str) -> Option<String> {
+    let suffix = path.strip_prefix(old_prefix)?;
+    if suffix.is_empty() || suffix.starts_with('/') {
+        Some(format!("{new_prefix}{suffix}"))
+    } else {
+        None
+    }
+}
+
+/// `PathRemap` describes how Autosar paths change as the result of a rename or move operation
+///
+/// Each entry maps an old path prefix to a new one. Renaming an element and moving an identifiable
+/// element both produce a single entry. Several entries are needed when a non-identifiable element
+/// which contains identifiable sub-elements is moved: in that case there is no single old path
+/// prefix which covers exactly the moved elements.
+pub(crate) struct PathRemap(Vec<(String, String)>);
+
+impl PathRemap {
+    /// create a `PathRemap` for a single subtree whose path changes from `old` to `new`
+    pub(crate) fn single(old: String, new: String) -> Self {
+        PathRemap(vec![(old, new)])
+    }
+
+    /// create a `PathRemap` from a list of (old prefix, new prefix) pairs
+    pub(crate) fn new(remap: Vec<(String, String)>) -> Self {
+        PathRemap(remap)
+    }
+
+    /// map an old Autosar path to its new value
+    ///
+    /// Returns `None` if the path is not affected by this remapping.
+    pub(crate) fn map(&self, path: &str) -> Option<String> {
+        self.0.iter().find_map(|(old, new)| replace_path_prefix(path, old, new))
+    }
+
+    /// returns true if this remapping does not change any path
+    pub(crate) fn is_noop(&self) -> bool {
+        self.0.iter().all(|(old, new)| old == new)
+    }
 }
 
 impl AutosarModel {
@@ -61,8 +104,7 @@ impl AutosarModel {
             files: Arc::new(parking_lot::Mutex::new(Vec::new())),
             identifiables: FxIndexMap::default(),
             reference_origins: FxHashMap::default(),
-            relative_reference_origins: FxHashMap::default(),
-            reference_bases: FxHashMap::default(),
+            relative_references: FxHashMap::default(),
             root_element: root_elem.clone(),
         }
         .wrap();
@@ -236,38 +278,29 @@ impl AutosarModel {
             return Err(AutosarDataError::OverlappingDataError { filename, path });
         }
 
-        // import references from the parser
+        // import references from the parser. The parser only knows the character data of each
+        // reference, so relative references are recorded as unresolved here; they are resolved once the
+        // whole file has been merged and its REFERENCE-BASE declarations are known.
         data.reference_origins.reserve(parser.references.len());
         for (refpath, referring_element, base) in parser.references {
-            if let Some(base_label) = base {
-                //relative reference
-                if let Some(xref) = data.relative_reference_origins.get_mut(&refpath) {
-                    xref.push((referring_element, base_label));
-                } else {
-                    data.relative_reference_origins
-                        .insert(refpath, vec![(referring_element, base_label)]);
-                }
+            if base.is_some() {
+                data.relative_references.insert(referring_element, None);
             } else {
-                // absolute reference
-                if let Some(xref) = data.reference_origins.get_mut(&refpath) {
-                    xref.push(referring_element);
-                } else {
-                    data.reference_origins.insert(refpath, vec![referring_element]);
-                }
-            }
-        }
-
-        // import reference bases from the parser
-        data.reference_bases.reserve(parser.reference_bases.len());
-        for (base_key, base_info) in parser.reference_bases {
-            if let Some(existing_base) = data.reference_bases.get_mut(&base_key) {
-                existing_base.push(base_info);
-            } else {
-                data.reference_bases.insert(base_key, vec![base_info]);
+                data.reference_origins
+                    .entry(refpath)
+                    .or_default()
+                    .push(referring_element);
             }
         }
 
         locked_file_list.push(arxml_file.clone());
+        drop(data);
+
+        // The relative references of the new file could not be resolved while it was being loaded. The
+        // new file may also declare REFERENCE-BASEs which change what the relative references of the
+        // files loaded before it resolve to, so every relative reference is resolved here, not just the
+        // ones which were just added.
+        self.resolve_relative_references();
 
         Ok((arxml_file, parser.warnings))
     }
@@ -703,8 +736,7 @@ impl AutosarModel {
                 locked_model.root_element.set_file_membership(HashSet::new());
                 locked_model.identifiables.clear();
                 locked_model.reference_origins.clear();
-                locked_model.relative_reference_origins.clear();
-                locked_model.reference_bases.clear();
+                locked_model.relative_references.clear();
             } else {
                 // other files still contribute elements, so only the elements specifically associated with this file should be removed
                 let _ = self.root_element().remove_from_file(file);
@@ -886,6 +918,10 @@ impl AutosarModel {
             copy.root_element().create_copied_sub_element(&element)?;
         }
 
+        // the copies contain unresolved relative references, since a reference base can only be
+        // resolved once the whole tree is in place
+        copy.resolve_relative_references();
+
         // `create_copied_sub_element` does not transfer information about file membership
         // this needs to be added back
         let orig_iter = self.elements_dfs();
@@ -1029,48 +1065,22 @@ impl AutosarModel {
     #[must_use]
     pub fn get_references_to(&self, target_path: &str) -> Vec<WeakElement> {
         let locked_model = self.0.read();
-        let mut origins = if let Some(origins) = locked_model.reference_origins.get(target_path) {
-            origins.clone()
-        } else {
-            Vec::new()
-        };
-
-        if !locked_model.relative_reference_origins.is_empty() {
-            // also check for relative references
-            let mut pos = target_path.rfind('/').map(|i| i + 1).unwrap_or(0);
-            while pos > 0 {
-                let suffix = &target_path[pos..];
-                if let Some(rel_origins) = locked_model.relative_reference_origins.get(suffix) {
-                    for (origin, base_label) in rel_origins {
-                        let Some(origin_elem) = origin.upgrade() else {
-                            continue;
-                        };
-                        let Some(package_path) = origin_elem.package().ok().flatten().and_then(|p| p.path().ok())
-                        else {
-                            continue;
-                        };
-                        let Some(base_path) = locked_model.resolve_reference_base_internal(base_label, &package_path)
-                        else {
-                            continue;
-                        };
-                        if let Some(rest) = target_path.strip_prefix(&base_path) {
-                            let rest = rest.strip_prefix('/').unwrap_or(rest);
-                            if rest == suffix {
-                                origins.push(origin.clone());
-                            }
-                        }
-                    }
-                }
-                pos = target_path[..pos - 1].rfind('/').map(|i| i + 1).unwrap_or(0);
-            }
-        }
-
-        origins
+        // relative references are registered under the path of their target as well, so a single lookup
+        // finds both kinds
+        locked_model
+            .reference_origins
+            .get(target_path)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// check all Autosar path references and return a list of elements with invalid references
     ///
     /// For each reference: The target must exist and the DEST attribute must correctly specify the type of the target
+    ///
+    /// Relative references are checked as well: their BASE attribute must name a REFERENCE-BASE
+    /// which is in scope, i.e. declared by the package containing the reference or by one of its
+    /// ancestor packages, and the relative path must lead to an existing element from there.
     ///
     /// If no references are invalid, then the return value is an empty list
     ///
@@ -1124,32 +1134,42 @@ impl AutosarModel {
             }
         }
 
+        // A relative reference whose base is not in scope has no target path at all, so it is not part
+        // of reference_origins and the loop above cannot report it.
+        for (referring_elem_weak, target_path) in &model.relative_references {
+            if target_path.is_none() && referring_elem_weak.upgrade().is_some() {
+                broken_refs.push(referring_elem_weak.clone());
+            }
+        }
+
         broken_refs
     }
 
-    /// create a weak reference to this data
+    /// Create a weak reference to this data
     pub(crate) fn downgrade(&self) -> WeakAutosarModel {
         WeakAutosarModel(Arc::downgrade(&self.0))
     }
 
-    // add an identifiable element to the cache
+    /// Add an identifiable element to the cache
     pub(crate) fn add_identifiable(&self, new_path: String, elem: WeakElement) {
         let mut model = self.0.write();
         model.identifiables.insert(new_path, elem);
     }
 
-    // fix a single identifiable element or tree of elements in the cache which has been moved/renamed
-    pub(crate) fn fix_identifiables(&self, old_path: &str, new_path: &str) {
+    /// Fix the caches after one or more subtrees of elements have been renamed or moved.
+    ///
+    /// This updates the keys of the `identifiables` map
+    pub(crate) fn fix_element_paths(&self, remap: &PathRemap) {
+        if remap.is_noop() {
+            return;
+        }
         let mut model = self.0.write();
 
         // the renamed element might contain other identifiable elements that are affected by the renaming
         let keys: Vec<String> = model.identifiables.keys().cloned().collect();
         for key in keys {
-            // find keys referring to entries inside the renamed package
-            if let Some(suffix) = key.strip_prefix(old_path)
-                && (suffix.is_empty() || suffix.starts_with('/'))
-            {
-                let new_key = format!("{new_path}{suffix}");
+            // find keys referring to entries inside the renamed/moved subtree
+            if let Some(new_key) = remap.map(&key) {
                 // fix the identifiables hashmap
                 if let Some(entry) = model.identifiables.swap_remove(&key) {
                     model.identifiables.insert(new_key, entry);
@@ -1158,151 +1178,186 @@ impl AutosarModel {
         }
     }
 
+    /// Fix the caches which record reference targets, after one or more subtrees of
+    /// elements have been renamed or moved, and update the referring elements to match.
+    ///
+    /// This updates the keys of the `reference_origins` map, as well as the character data of each
+    /// referring element, so that both absolute and relative references follow their target. The
+    /// entries of `relative_references` are updated to the new keys.
+    pub(crate) fn fix_reference_paths(
+        &self,
+        remap: &PathRemap,
+        version: AutosarVersion,
+    ) -> Result<(), AutosarDataError> {
+        if remap.is_noop() {
+            return Ok(());
+        }
+        let mut model = self.0.write();
+
+        // Check all references and update those that point to a renamed/moved element. Since the key is
+        // the path of the target, this applies to relative references in exactly the same way; only the
+        // character data that has to be written back differs between the two.
+        let refpaths = model.reference_origins.keys().cloned().collect::<Vec<String>>();
+        for refpath in refpaths {
+            // if the existing reference points into a renamed/moved subtree, then it needs to be updated
+            let Some(refpath_new) = remap.map(&refpath).filter(|new| *new != refpath) else {
+                continue;
+            };
+            let Some(reflist) = model.reference_origins.remove(&refpath) else {
+                continue;
+            };
+            let mut updated = Vec::with_capacity(reflist.len());
+            let mut unchanged = Vec::new();
+            for weak_ref_elem in reflist {
+                let is_relative = model.relative_references.contains_key(&weak_ref_elem);
+                let new_content = match weak_ref_elem.upgrade() {
+                    Some(ref_elem) => {
+                        let new_content = if is_relative {
+                            model.fix_relative_reference_content(&ref_elem, &refpath, &refpath_new, remap)
+                        } else {
+                            Some(refpath_new.clone())
+                        };
+                        if let Some(new_content) = &new_content {
+                            // can't use Element::set_character_data() here, because the model is locked
+                            ref_elem.0.write().set_character_data(new_content.clone(), version)?;
+                        }
+                        new_content
+                    }
+                    // the element is gone; the entry follows the key so that it is pruned in one place
+                    None => Some(refpath_new.clone()),
+                };
+                if new_content.is_some() {
+                    if is_relative {
+                        model
+                            .relative_references
+                            .insert(weak_ref_elem.clone(), Some(refpath_new.clone()));
+                    }
+                    updated.push(weak_ref_elem);
+                } else {
+                    // The new target cannot be expressed relative to this reference base, so the
+                    // character data is left alone and the entry keeps its old key. The operation which
+                    // moved the target out of the base is responsible for calling
+                    // resolve_relative_references() to settle what the reference now points at.
+                    unchanged.push(weak_ref_elem);
+                }
+            }
+            if !updated.is_empty() {
+                model.reference_origins.insert(refpath_new, updated);
+            }
+            if !unchanged.is_empty() {
+                model.reference_origins.insert(refpath, unchanged);
+            }
+        }
+
+        Ok(())
+    }
+
     // remove a deleted element from the cache
     pub(crate) fn remove_identifiable(&self, path: &str) {
         let mut model = self.0.write();
         model.identifiables.swap_remove(path);
     }
 
+    /// Register a reference element
+    ///
+    /// `new_ref` is the character data of the reference and `base` its BASE attribute. An absolute
+    /// reference is registered under its character data, which is already the path of its target.
+    ///
+    /// A relative reference cannot be resolved here: this is also called while element locks are held,
+    /// and resolving a reference base means reading the element tree. It is therefore only recorded as
+    /// unresolved, and [`Self::resolve_relative_references`] computes its target path afterwards.
     pub(crate) fn add_reference_origin(&self, new_ref: &str, base: Option<&str>, origin: WeakElement) {
-        if let Some(base) = base {
-            self.add_relative_reference_origin(new_ref, base, origin);
-        } else {
-            self.add_absolute_reference_origin(new_ref, origin);
-        }
-    }
-
-    fn add_absolute_reference_origin(&self, new_ref: &str, origin: WeakElement) {
         let mut data = self.0.write();
-        // add the new entry
-        if let Some(referrer_list) = data.reference_origins.get_mut(new_ref) {
-            referrer_list.push(origin);
+        if base.is_some() {
+            data.relative_references.insert(origin, None);
         } else {
-            data.reference_origins.insert(new_ref.to_owned(), vec![origin]);
+            data.reference_origins
+                .entry(new_ref.to_owned())
+                .or_default()
+                .push(origin);
         }
     }
 
-    fn add_relative_reference_origin(&self, new_ref: &str, base: &str, origin: WeakElement) {
+    /// De-register a reference element
+    ///
+    /// `reference` is the character data of the reference, which is the key of an absolute reference.
+    /// The key of a relative reference is taken from `relative_references` instead: it cannot be
+    /// recomputed here, because this is also called while element locks are held and after the element
+    /// has been detached from the tree, when its reference base can no longer be resolved.
+    pub(crate) fn remove_reference_origin(&self, reference: &str, element: WeakElement) {
         let mut data = self.0.write();
-        if let Some(referrer_list) = data.relative_reference_origins.get_mut(new_ref) {
-            referrer_list.push((origin, base.to_string()));
-        } else {
-            data.relative_reference_origins
-                .insert(new_ref.to_owned(), vec![(origin, base.to_string())]);
+        let key = match data.relative_references.remove(&element) {
+            Some(relative_key) => relative_key,
+            None => Some(reference.to_owned()),
+        };
+        if let Some(key) = key {
+            data.remove_reference_origin_by_key(&key, &element);
         }
     }
 
+    /// Move a reference element to a different key, after its character data or BASE attribute changed
+    ///
+    /// A relative reference is left unresolved, exactly as in [`Self::add_reference_origin`].
     pub(crate) fn fix_reference_origins(
         &self,
         old_ref: &str,
         new_ref: &str,
-        old_base: Option<&str>,
         new_base: Option<&str>,
         origin: WeakElement,
     ) {
-        if old_ref != new_ref || old_base != new_base {
-            self.remove_reference_origin(old_ref, old_base, origin.clone());
-            self.add_reference_origin(new_ref, new_base, origin);
-        }
+        self.remove_reference_origin(old_ref, origin.clone());
+        self.add_reference_origin(new_ref, new_base, origin);
     }
 
-    pub(crate) fn remove_reference_origin(&self, reference: &str, base: Option<&str>, element: WeakElement) {
-        if let Some(base) = base {
-            self.remove_relative_reference_origin(reference, base, element);
-        } else {
-            self.remove_absolute_reference_origin(reference, element);
+    /// Compute the target path of every relative reference and update the caches to match
+    ///
+    /// This must be called by any operation which can change what a relative reference resolves to:
+    /// the reference itself was created or modified, it moved to a package where a different reference
+    /// base is in scope, or a REFERENCE-BASE declaration changed. It is idempotent, and free for the
+    /// common case of a model which contains no relative references at all.
+    ///
+    /// It must not be called while an element lock is held, since resolving a reference base reads the
+    /// element tree.
+    pub(crate) fn resolve_relative_references(&self) {
+        let mut model = self.0.write();
+        if model.relative_references.is_empty() {
+            return;
         }
-    }
-
-    fn remove_absolute_reference_origin(&self, reference: &str, element: WeakElement) {
-        let mut data = self.0.write();
-        let mut count = 1;
-        if let Some(referrer_list) = data.reference_origins.get_mut(reference) {
-            if let Some(index) = referrer_list.iter().position(|x| *x == element) {
-                referrer_list.swap_remove(index);
+        let origins: Vec<WeakElement> = model.relative_references.keys().cloned().collect();
+        for origin in origins {
+            let new_key = origin
+                .upgrade()
+                .and_then(|origin_elem| origin_elem.resolve_relative_target());
+            let old_key = model
+                .relative_references
+                .insert(origin.clone(), new_key.clone())
+                .flatten();
+            if old_key == new_key {
+                continue;
             }
-            count = referrer_list.len();
-        }
-        if count == 0 {
-            data.reference_origins.remove(reference);
-        }
-    }
-
-    fn remove_relative_reference_origin(&self, reference: &str, base: &str, element: WeakElement) {
-        let mut data = self.0.write();
-        let mut count = 1;
-        if let Some(referrer_list) = data.relative_reference_origins.get_mut(reference) {
-            if let Some(index) = referrer_list.iter().position(|(x, b)| *x == element && *b == base) {
-                referrer_list.swap_remove(index);
+            if let Some(old_key) = old_key {
+                model.remove_reference_origin_by_key(&old_key, &origin);
             }
-            count = referrer_list.len();
-        }
-        if count == 0 {
-            data.relative_reference_origins.remove(reference);
-        }
-    }
-
-    pub(crate) fn resolve_reference_base(&self, base: &str, ref_package_path: &str) -> Option<String> {
-        let model = self.0.read();
-        model.resolve_reference_base_internal(base, ref_package_path)
-    }
-
-    pub(crate) fn fix_reference_base(
-        &self,
-        old_label: Option<String>,
-        new_label: String,
-        package_ref_val: String,
-        ref_base_attr: Option<String>,
-        owner_package_path: String,
-    ) {
-        let mut data = self.0.write();
-        // Remove the previous entry for this owner package under the old label.
-        if let Some(old_label) = old_label {
-            let mut remove_old_key = false;
-            if let Some(ref_base_info_list) = data.reference_bases.get_mut(&old_label) {
-                if let Some(index) = ref_base_info_list
-                    .iter()
-                    .position(|info| info.owner_package_path == owner_package_path)
-                {
-                    ref_base_info_list.swap_remove(index);
+            match new_key {
+                Some(new_key) => model.reference_origins.entry(new_key).or_default().push(origin),
+                // the reference base is not in scope: the reference has no target path, and the entry
+                // is only kept so that check_references() can report it
+                None => {
+                    if origin.upgrade().is_none() {
+                        // the element is gone, so the entry is of no use to anyone
+                        model.relative_references.remove(&origin);
+                    }
                 }
-                remove_old_key = ref_base_info_list.is_empty();
             }
-            if remove_old_key {
-                data.reference_bases.remove(&old_label);
-            }
-        }
-
-        // Upsert the new entry for this owner package under the new label.
-        let ref_base_info_list = data.reference_bases.entry(new_label).or_default();
-        if let Some(existing_info) = ref_base_info_list
-            .iter_mut()
-            .find(|info| info.owner_package_path == owner_package_path)
-        {
-            existing_info.package_ref = package_ref_val;
-            existing_info.package_ref_base = ref_base_attr;
-        } else {
-            ref_base_info_list.push(ReferenceBaseInfo {
-                package_ref: package_ref_val,
-                package_ref_base: ref_base_attr,
-                owner_package_path,
-            });
         }
     }
 
-    /// remove a reference base from the cache
-    pub(crate) fn remove_reference_base(&self, label: &str, owner_package_path: &str) {
-        let mut data = self.0.write();
-        if let Some(ref_base_info_list) = data.reference_bases.get_mut(label)
-            && let Some(index) = ref_base_info_list
-                .iter()
-                .position(|info| info.owner_package_path == owner_package_path)
-        {
-            ref_base_info_list.swap_remove(index);
-            if ref_base_info_list.is_empty() {
-                data.reference_bases.remove(label);
-            }
-        }
+    /// Get the absolute path that a relative reference currently resolves to
+    ///
+    /// The result is `None` if `element` is not a registered relative reference, or if its reference
+    /// base is not in scope, in which case it has no target path at all.
+    pub(crate) fn relative_reference_target(&self, element: &WeakElement) -> Option<String> {
+        self.0.read().relative_references.get(element).cloned().flatten()
     }
 }
 
@@ -1320,40 +1375,41 @@ impl AutosarModelRaw {
         AutosarModel(Arc::new(RwLock::new(self)))
     }
 
-    fn resolve_reference_base_internal(&self, base: &str, ref_package_path: &str) -> Option<String> {
-        let mut current_base = base;
-        let mut path_components = VecDeque::with_capacity(0);
-        let mut ref_package_path = ref_package_path;
-        loop {
-            // get (potentially) a list of reference bases that all have the requested base label
-            let ref_base_info_list = self.reference_bases.get(current_base)?;
-            // select the most applicable reference base from the list based on the owner_package_path (longest prefix match)
-            let ref_base_info = ref_base_info_list
-                .iter()
-                .filter(|info| ref_package_path.starts_with(&info.owner_package_path))
-                .max_by_key(|info| info.owner_package_path.len())?;
+    /// Rewrite the character data of a relative reference after its target moved from `old_target` to
+    /// `new_target`, so that it still refers to the same element. The new character data is returned.
+    ///
+    /// The path of the reference base is recovered from the old target path and the old character data,
+    /// so nothing has to be resolved here. The result is `None` if the new target cannot be expressed
+    /// relative to the same reference base, which means the reference cannot follow its target.
+    fn fix_relative_reference_content(
+        &mut self,
+        element: &Element,
+        old_target: &str,
+        new_target: &str,
+        remap: &PathRemap,
+    ) -> Option<String> {
+        let old_content = element.character_data()?.string_value()?;
+        // old_target is the base path followed by '/' and the character data, so what remains after
+        // removing those is the path of the reference base
+        let base_path = old_target.strip_suffix(&old_content)?.strip_suffix('/')?;
+        // the reference base may have been renamed or moved as well
+        let new_base_path = remap.map(base_path);
+        let new_base_path = new_base_path.as_deref().unwrap_or(base_path);
+        let new_content = replace_path_prefix(new_target, new_base_path, "")?
+            .strip_prefix('/')?
+            .to_owned();
 
-            // base is relative to a package, so the path components of the package need to be added to the path
-            if let Some(package_ref_base) = &ref_base_info.package_ref_base {
-                // the reference base uses (at least) another reference base as its own base, so we
-                // loop and build up the path components until we reach a reference base that is absolute
-                path_components.push_front(&ref_base_info.package_ref);
-                current_base = package_ref_base;
-                ref_package_path = &ref_base_info.owner_package_path;
-            } else {
-                if path_components.is_empty() {
-                    return Some(ref_base_info.package_ref.clone());
-                } else {
-                    path_components.push_front(&ref_base_info.package_ref);
-                    // let resolved_path = path_components.join("/"); - join() doesn't exist for &String, so we need to do it manually
-                    let mut resolved_path = String::new();
-                    for component in path_components {
-                        resolved_path.push_str(component);
-                        resolved_path.push('/');
-                    }
-                    resolved_path.pop(); // remove the trailing '/'
-                    return Some(resolved_path);
-                }
+        Some(new_content)
+    }
+
+    /// remove `element` from the list of referring elements registered for the target path `key`
+    fn remove_reference_origin_by_key(&mut self, key: &str, element: &WeakElement) {
+        if let Some(origins) = self.reference_origins.get_mut(key) {
+            if let Some(index) = origins.iter().position(|origin| origin == element) {
+                origins.swap_remove(index);
+            }
+            if origins.is_empty() {
+                self.reference_origins.remove(key);
             }
         }
     }
@@ -1372,8 +1428,7 @@ impl std::fmt::Debug for AutosarModel {
         dbgstruct.field("files", &files);
         dbgstruct.field("identifiables", &model.identifiables);
         dbgstruct.field("reference_origins", &model.reference_origins);
-        dbgstruct.field("relative_reference_origins", &model.relative_reference_origins);
-        dbgstruct.field("reference_bases", &model.reference_bases);
+        dbgstruct.field("relative_references", &model.relative_references);
         dbgstruct.finish()
     }
 }
@@ -1407,6 +1462,141 @@ impl WeakAutosarModel {
 impl std::fmt::Debug for WeakAutosarModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("AutosarModel:WeakRef {:p}", Weak::as_ptr(&self.0)))
+    }
+}
+
+/// Verification of the model-level caches, for use by the tests
+///
+/// Every one of these caches is derived from the element tree, so each mutating operation has to keep
+/// them in agreement with it. `check_references` cannot serve as that check: it only reports cache
+/// entries which no longer resolve, and never notices a reference which exists in the tree but is
+/// missing from the cache.
+#[cfg(test)]
+impl AutosarModel {
+    /// Check that the reference caches agree with the element tree
+    ///
+    /// The `Err` describes the first inconsistency that was found. Dead `WeakElement`s in the caches
+    /// are ignored, since such entries are only pruned when they happen to be encountered.
+    // clippy::mutable_key_type fires for the HashSet<Element>, because an Element contains a lock.
+    // Hash and Eq of Element are both defined in terms of the pointer, so interior mutability cannot
+    // affect them.
+    #[allow(clippy::mutable_key_type)]
+    pub(crate) fn verify_reference_caches(&self) -> Result<(), String> {
+        let mut tree_elements = std::collections::HashSet::new();
+        // (character data, element) of each reference without a BASE attribute
+        let mut absolute_refs: Vec<(String, Element)> = Vec::new();
+        // each reference with a BASE attribute, i.e. each relative reference
+        let mut relative_refs: Vec<Element> = Vec::new();
+
+        // collect what the element tree says
+        for (_, element) in self.root_element().elements_dfs() {
+            tree_elements.insert(element.clone());
+            if element.is_reference()
+                && let Some(CharacterData::String(text)) = element.character_data()
+            {
+                if element.attribute_value(AttributeName::Base).is_some() {
+                    relative_refs.push(element.clone());
+                } else {
+                    absolute_refs.push((text, element.clone()));
+                }
+            }
+        }
+
+        let model = self.0.read();
+
+        // an absolute reference is registered under its own character data
+        for (text, element) in &absolute_refs {
+            if model.relative_references.contains_key(&element.downgrade()) {
+                return Err(format!(
+                    "{} has no BASE attribute, but is registered as a relative reference",
+                    element.xml_path()
+                ));
+            }
+            if !model
+                .reference_origins
+                .get(text)
+                .is_some_and(|origins| origins.contains(&element.downgrade()))
+            {
+                return Err(format!(
+                    "{} references \"{text}\", but is missing from reference_origins[\"{text}\"]",
+                    element.xml_path()
+                ));
+            }
+        }
+
+        // a relative reference is registered under the path it resolves to, which the reverse index has
+        // to agree with
+        for element in &relative_refs {
+            let expected_target = element.resolve_relative_target();
+            let Some(cached_target) = model.relative_references.get(&element.downgrade()) else {
+                return Err(format!(
+                    "the relative reference {} is missing from relative_references",
+                    element.xml_path()
+                ));
+            };
+            if *cached_target != expected_target {
+                return Err(format!(
+                    "the relative reference {} resolves to {expected_target:?}, but relative_references says {cached_target:?}",
+                    element.xml_path()
+                ));
+            }
+            if let Some(target) = cached_target
+                && !model
+                    .reference_origins
+                    .get(target)
+                    .is_some_and(|origins| origins.contains(&element.downgrade()))
+            {
+                return Err(format!(
+                    "the relative reference {} resolves to \"{target}\", but is missing from reference_origins[\"{target}\"]",
+                    element.xml_path()
+                ));
+            }
+        }
+
+        // ... and every cache entry must describe a reference which is still in the tree
+        for (key, origins) in &model.reference_origins {
+            for weak_origin in origins {
+                let Some(element) = weak_origin.upgrade() else {
+                    continue;
+                };
+                if !tree_elements.contains(&element) {
+                    return Err(format!(
+                        "reference_origins[\"{key}\"] contains {}, which is not in the element tree",
+                        element.xml_path()
+                    ));
+                }
+                let registered_correctly = match model.relative_references.get(weak_origin) {
+                    // a relative reference: the reverse index must name this key
+                    Some(target) => target.as_deref() == Some(key.as_str()),
+                    // an absolute reference: its character data must be this key
+                    None => absolute_refs.iter().any(|(text, elem)| elem == &element && text == key),
+                };
+                if !registered_correctly {
+                    return Err(format!(
+                        "reference_origins[\"{key}\"] contains {}, whose reference is {:?} with BASE={:?} and reverse index entry {:?}",
+                        element.xml_path(),
+                        element.character_data().and_then(|cdata| cdata.string_value()),
+                        element
+                            .attribute_value(AttributeName::Base)
+                            .and_then(|cdata| cdata.string_value()),
+                        model.relative_references.get(weak_origin)
+                    ));
+                }
+            }
+        }
+        for weak_origin in model.relative_references.keys() {
+            let Some(element) = weak_origin.upgrade() else {
+                continue;
+            };
+            if !relative_refs.contains(&element) {
+                return Err(format!(
+                    "relative_references contains {}, which is not a relative reference in the element tree",
+                    element.xml_path()
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1845,7 +2035,7 @@ mod test {
     }
 
     #[test]
-    fn remove_last_file_clears_relative_reference_origins() {
+    fn remove_last_file_clears_reference_caches() {
         const FILEBUF: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
 <AUTOSAR xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://autosar.org/schema/r4.0" xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd">
     <AR-PACKAGES>
@@ -1883,10 +2073,12 @@ mod test {
         let model = AutosarModel::new();
         let (file, _) = model.load_buffer(FILEBUF, "test", true).unwrap();
 
-        assert!(!model.0.read().relative_reference_origins.is_empty());
+        assert!(!model.0.read().relative_references.is_empty());
+        assert!(!model.0.read().reference_origins.is_empty());
         model.remove_file(&file);
 
-        assert!(model.0.read().relative_reference_origins.is_empty());
+        assert!(model.0.read().relative_references.is_empty());
+        assert!(model.0.read().reference_origins.is_empty());
     }
 
     #[test]
@@ -1994,6 +2186,7 @@ mod test {
         assert_eq!(refs.len(), 1);
         let refs = model.get_references_to("nonexistent");
         assert!(refs.is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 
     #[test]
@@ -2278,11 +2471,12 @@ mod test {
         let b1_refs = model.get_references_to("/path/to/entry_B1");
         assert!(b1_refs.len() == 1);
         assert!(b1_refs[0].upgrade().is_some());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 
-    #[test]
-    fn complex_reference_bases() {
-        const FILEBUF1: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+    // a model with three reference bases: two in the outer package "/BasesPkg", and one in
+    // "/BasesPkg/SubPackage" whose own PACKAGE-REF is relative to the base "BaseA"
+    const FILEBUF1_COMPLEX_BASES: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
 <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <AR-PACKAGES>
     <AR-PACKAGE><SHORT-NAME>BasesPkg</SHORT-NAME>
@@ -2335,8 +2529,121 @@ mod test {
     </AR-PACKAGE>
   </AR-PACKAGES>
 </AUTOSAR>"#.as_bytes();
+
+    /// a way of corrupting the caches: a description, and the corruption itself. The returned
+    /// elements are kept alive by the caller, so that entries referring to them are not skipped as
+    /// dead weak references.
+    type CacheCorruption = (&'static str, fn(&AutosarModel) -> Vec<Element>);
+
+    // the PACKAGE-REF of "BaseA" in FILEBUF1_COMPLEX_BASES, which is an absolute reference
+    fn get_absolute_package_ref(model: &AutosarModel) -> Element {
+        model
+            .get_element_by_path("/BasesPkg")
+            .and_then(|el_package| el_package.get_sub_element(ElementName::ReferenceBases))
+            .and_then(|el_bases| el_bases.get_sub_element_at(0))
+            .and_then(|el_base| el_base.get_sub_element(ElementName::PackageRef))
+            .unwrap()
+    }
+
+    #[test]
+    fn verify_reference_caches_detects_inconsistency() {
+        // verify_reference_caches() is asserted by many tests, so it must be able to fail: this test
+        // corrupts the caches in each of the ways that real bugs have corrupted them, and requires
+        // every one of them to be reported.
+        let corruptions: [CacheCorruption; 8] = [
+            // a relative reference which is missing from the reverse index entirely
+            ("missing entry", |model| {
+                model.0.write().relative_references.clear();
+                vec![]
+            }),
+            // an absolute reference which is missing from the index
+            ("missing absolute entry", |model| {
+                let el_package_ref = get_absolute_package_ref(model);
+                let target = el_package_ref.character_data().unwrap().string_value().unwrap();
+                model.0.write().reference_origins.remove(&target);
+                vec![el_package_ref]
+            }),
+            // an absolute reference which is registered as a relative one
+            ("absolute reference in the reverse index", |model| {
+                let el_package_ref = get_absolute_package_ref(model);
+                model
+                    .0
+                    .write()
+                    .relative_references
+                    .insert(el_package_ref.downgrade(), None);
+                vec![el_package_ref]
+            }),
+            // an absolute reference registered under a key which is not its character data
+            ("wrong key", |model| {
+                let el_package_ref = get_absolute_package_ref(model);
+                model
+                    .0
+                    .write()
+                    .reference_origins
+                    .entry("/Wrong".to_string())
+                    .or_default()
+                    .push(el_package_ref.downgrade());
+                vec![el_package_ref]
+            }),
+            // an element in the reverse index which is not a reference at all
+            ("reverse index entry which is not a reference", |model| {
+                let el_system = model.get_element_by_path("/BasesPkg/SubPackage/System").unwrap();
+                model.0.write().relative_references.insert(el_system.downgrade(), None);
+                vec![el_system]
+            }),
+            // a relative reference whose reverse index entry names the wrong target path
+            ("stale target path", |model| {
+                let el_ref = get_complex_bases_refs(model).0;
+                model
+                    .0
+                    .write()
+                    .relative_references
+                    .insert(el_ref.downgrade(), Some("/Stale".to_string()));
+                vec![el_ref]
+            }),
+            // a reference which is in the reverse index, but not in the bucket it names
+            ("missing bucket entry", |model| {
+                let el_ref = get_complex_bases_refs(model).0;
+                let mut model_locked = model.0.write();
+                let target = model_locked
+                    .relative_references
+                    .get(&el_ref.downgrade())
+                    .cloned()
+                    .flatten()
+                    .unwrap();
+                model_locked.reference_origins.remove(&target);
+                vec![el_ref]
+            }),
+            // an entry for an element which has been removed from the tree
+            ("removed element", |model| {
+                let el_ref = get_complex_bases_refs(model).0;
+                let el_parent = el_ref.parent().unwrap().unwrap();
+                model
+                    .0
+                    .write()
+                    .reference_origins
+                    .insert("/detached".to_string(), vec![el_ref.downgrade()]);
+                el_parent.remove_sub_element(el_ref.clone()).unwrap();
+                vec![el_ref]
+            }),
+        ];
+
+        for (description, corrupt) in corruptions {
+            let model = AutosarModel::new();
+            model.load_buffer(FILEBUF1_COMPLEX_BASES, "test", true).unwrap();
+            assert_eq!(model.verify_reference_caches(), Ok(()));
+            let _keep_alive = corrupt(&model);
+            assert!(
+                model.verify_reference_caches().is_err(),
+                "verify_reference_caches() did not detect: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn complex_reference_bases() {
         let model = AutosarModel::new();
-        let result = model.load_buffer(FILEBUF1, "test", true);
+        let result = model.load_buffer(FILEBUF1_COMPLEX_BASES, "test", true);
         assert!(result.is_ok());
 
         let el_system = model.get_element_by_path("/BasesPkg/SubPackage/System").unwrap();
@@ -2358,5 +2665,476 @@ mod test {
 
         let origins2 = model.get_references_to("/ContentPkg2/Ecu");
         assert_eq!(origins2.len(), 1);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    // get the two FIBEX-ELEMENT-REFs of FILEBUF1_COMPLEX_BASES: the first one uses the reference
+    // base "BaseB" (= /ContentPkg/SubPackage), the second one uses "BaseC" (= /ContentPkg2)
+    fn get_complex_bases_refs(model: &AutosarModel) -> (Element, Element) {
+        let el_fibex_elements = model
+            .get_element_by_path("/BasesPkg/SubPackage/System")
+            .and_then(|el_system| el_system.get_sub_element(ElementName::FibexElements))
+            .unwrap();
+        let mut refs = el_fibex_elements
+            .sub_elements()
+            .filter_map(|ferc| ferc.get_sub_element(ElementName::FibexElementRef));
+        (refs.next().unwrap(), refs.next().unwrap())
+    }
+
+    #[test]
+    fn rename_relative_reference_target() {
+        let model = AutosarModel::new();
+        let result = model.load_buffer(FILEBUF1_COMPLEX_BASES, "test", true);
+        assert!(result.is_ok());
+        let (el_ref_base_b, el_ref_base_c) = get_complex_bases_refs(&model);
+
+        // rename /ContentPkg/SubPackage/Ecu; the FibexElementRef refers to it using the reference base "BaseB" (/ContentPkg/SubPackage)
+        let el_ecu = model.get_element_by_path("/ContentPkg/SubPackage/Ecu").unwrap();
+        el_ecu.set_item_name("RenamedEcu").unwrap();
+        assert_eq!(
+            el_ref_base_b.character_data().unwrap().string_value().unwrap(),
+            "RenamedEcu"
+        );
+        assert_eq!(el_ref_base_b.get_reference_target().unwrap(), el_ecu);
+        // the other reference uses a different base and points at a different element: it is unchanged
+        assert_eq!(el_ref_base_c.character_data().unwrap().string_value().unwrap(), "Ecu");
+        assert_eq!(
+            el_ref_base_c.get_reference_target().unwrap(),
+            model.get_element_by_path("/ContentPkg2/Ecu").unwrap()
+        );
+
+        // the cache must follow the renaming as well: both references are still known, each under
+        // the (new) relative path which is the character data of the referring element
+        assert_eq!(model.get_references_to("/ContentPkg/SubPackage/RenamedEcu").len(), 1);
+        assert_eq!(model.get_references_to("/ContentPkg/SubPackage/Ecu").len(), 0);
+        assert_eq!(model.get_references_to("/ContentPkg2/Ecu").len(), 1);
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn rename_relative_reference_target_repeatedly() {
+        // renaming the target of a relative reference must leave the caches in a state which allows
+        // the next rename to find the reference again
+        let model = AutosarModel::new();
+        let result = model.load_buffer(FILEBUF1_COMPLEX_BASES, "test", true);
+        assert!(result.is_ok());
+        let (el_ref_base_b, _) = get_complex_bases_refs(&model);
+
+        let el_ecu = model.get_element_by_path("/ContentPkg/SubPackage/Ecu").unwrap();
+        for new_name in ["Ecu2", "Ecu3", "Ecu4"] {
+            el_ecu.set_item_name(new_name).unwrap();
+            assert_eq!(
+                el_ref_base_b.character_data().unwrap().string_value().unwrap(),
+                new_name
+            );
+            assert_eq!(el_ref_base_b.get_reference_target().unwrap(), el_ecu);
+            assert_eq!(model.get_references_to(&el_ecu.path().unwrap()).len(), 1);
+            assert!(model.check_references().is_empty());
+        }
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    // a model with a relative reference whose relative path consists of more than one path
+    // component: BASE="BaseA" resolves to /ContentPkg, so "SubPackage/Ecu" leads to
+    // /ContentPkg/SubPackage/Ecu
+    const FILEBUF_MULTI_COMPONENT_RELATIVE_REF: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+<AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <AR-PACKAGES>
+    <AR-PACKAGE><SHORT-NAME>BasesPkg</SHORT-NAME>
+      <REFERENCE-BASES>
+        <REFERENCE-BASE>
+          <SHORT-LABEL>BaseA</SHORT-LABEL>
+          <PACKAGE-REF DEST="AR-PACKAGE">/ContentPkg</PACKAGE-REF>
+        </REFERENCE-BASE>
+      </REFERENCE-BASES>
+      <ELEMENTS>
+        <SYSTEM><SHORT-NAME>System</SHORT-NAME>
+          <FIBEX-ELEMENTS>
+            <FIBEX-ELEMENT-REF-CONDITIONAL>
+              <FIBEX-ELEMENT-REF DEST="ECU-INSTANCE" BASE="BaseA">SubPackage/Ecu</FIBEX-ELEMENT-REF>
+            </FIBEX-ELEMENT-REF-CONDITIONAL>
+          </FIBEX-ELEMENTS>
+        </SYSTEM>
+      </ELEMENTS>
+    </AR-PACKAGE>
+    <AR-PACKAGE><SHORT-NAME>ContentPkg</SHORT-NAME>
+      <AR-PACKAGES>
+        <AR-PACKAGE><SHORT-NAME>SubPackage</SHORT-NAME>
+          <ELEMENTS>
+            <ECU-INSTANCE><SHORT-NAME>Ecu</SHORT-NAME></ECU-INSTANCE>
+          </ELEMENTS>
+        </AR-PACKAGE>
+      </AR-PACKAGES>
+    </AR-PACKAGE>
+  </AR-PACKAGES>
+</AUTOSAR>"#.as_bytes();
+
+    // get the FIBEX-ELEMENT-REF of FILEBUF_MULTI_COMPONENT_RELATIVE_REF
+    fn get_multi_component_relative_ref(model: &AutosarModel) -> Element {
+        model
+            .get_element_by_path("/BasesPkg/System")
+            .and_then(|el_system| el_system.get_sub_element(ElementName::FibexElements))
+            .and_then(|el_fibex_elements| el_fibex_elements.get_sub_element_at(0))
+            .and_then(|ferc| ferc.get_sub_element(ElementName::FibexElementRef))
+            .unwrap()
+    }
+
+    #[test]
+    fn rename_package_inside_relative_reference_path() {
+        // a relative path can consist of several path components, so a renamed element can also be
+        // an ancestor of the reference target
+        let model = AutosarModel::new();
+        let result = model.load_buffer(FILEBUF_MULTI_COMPONENT_RELATIVE_REF, "test", true);
+        assert!(result.is_ok());
+        let el_ref = get_multi_component_relative_ref(&model);
+        let el_ecu = el_ref.get_reference_target().unwrap();
+
+        // rename the intermediate package, which is part of the relative path
+        let el_subpackage = model.get_element_by_path("/ContentPkg/SubPackage").unwrap();
+        el_subpackage.set_item_name("SubPkgX").unwrap();
+        assert_eq!(el_ref.character_data().unwrap().string_value().unwrap(), "SubPkgX/Ecu");
+        assert_eq!(el_ref.get_reference_target().unwrap(), el_ecu);
+        assert_eq!(model.get_references_to("/ContentPkg/SubPkgX/Ecu").len(), 1);
+        assert!(model.check_references().is_empty());
+
+        // renaming the package which the reference base points to does not change the relative path
+        let el_content_package = model.get_element_by_path("/ContentPkg").unwrap();
+        el_content_package.set_item_name("ContentPkgX").unwrap();
+        assert_eq!(el_ref.character_data().unwrap().string_value().unwrap(), "SubPkgX/Ecu");
+        assert_eq!(el_ref.get_reference_target().unwrap(), el_ecu);
+        assert_eq!(model.get_references_to("/ContentPkgX/SubPkgX/Ecu").len(), 1);
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_relative_reference_target() {
+        // moving the target of a relative reference inside the subtree of its reference base changes
+        // the relative path, and the reference must follow
+        let model = AutosarModel::new();
+        let result = model.load_buffer(FILEBUF_MULTI_COMPONENT_RELATIVE_REF, "test", true);
+        assert!(result.is_ok());
+        let el_ref = get_multi_component_relative_ref(&model);
+        let el_ecu = el_ref.get_reference_target().unwrap();
+
+        // create /ContentPkg/SubPackage2 and move the reference target there
+        let el_elements2 = model
+            .get_element_by_path("/ContentPkg")
+            .and_then(|el_package| el_package.get_sub_element(ElementName::ArPackages))
+            .and_then(|el_packages| {
+                el_packages
+                    .create_named_sub_element(ElementName::ArPackage, "SubPackage2")
+                    .ok()
+            })
+            .and_then(|el_package2| el_package2.create_sub_element(ElementName::Elements).ok())
+            .unwrap();
+        el_elements2.move_element_here(&el_ecu).unwrap();
+
+        assert_eq!(el_ecu.path().unwrap(), "/ContentPkg/SubPackage2/Ecu");
+        assert_eq!(
+            el_ref.character_data().unwrap().string_value().unwrap(),
+            "SubPackage2/Ecu"
+        );
+        assert_eq!(el_ref.get_reference_target().unwrap(), el_ecu);
+        assert_eq!(model.get_references_to("/ContentPkg/SubPackage2/Ecu").len(), 1);
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_relative_reference_target_out_of_base() {
+        // A relative path can only lead to elements inside the subtree of its reference base, so a
+        // reference cannot follow a target which is moved out of that subtree. The BASE attribute is
+        // never rewritten, so the reference keeps its text and becomes invalid.
+        let model = AutosarModel::new();
+        let result = model.load_buffer(FILEBUF_MULTI_COMPONENT_RELATIVE_REF, "test", true);
+        assert!(result.is_ok());
+        let el_ref = get_multi_component_relative_ref(&model);
+        let el_ecu = el_ref.get_reference_target().unwrap();
+
+        // /BasesPkg is outside the subtree of the reference base, which is /ContentPkg
+        let el_elements = model
+            .get_element_by_path("/BasesPkg")
+            .and_then(|el_package| el_package.get_sub_element(ElementName::Elements))
+            .unwrap();
+        el_elements.move_element_here(&el_ecu).unwrap();
+
+        assert_eq!(el_ecu.path().unwrap(), "/BasesPkg/Ecu");
+        // the reference could not follow, so it still contains its original path
+        assert_eq!(
+            el_ref.character_data().unwrap().string_value().unwrap(),
+            "SubPackage/Ecu"
+        );
+        assert!(el_ref.get_reference_target().is_err());
+        assert!(model.get_references_to("/BasesPkg/Ecu").is_empty());
+        // ... and the now dangling reference is reported
+        let broken = model.check_references();
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].upgrade().unwrap(), el_ref);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn rename_package_referenced_by_relative_reference_base() {
+        // /ContentPkg/SubPackage is named by the PACKAGE-REF of the reference base "BaseB", which is
+        // itself relative (BASE="BaseA"). Renaming the package must update the character data of that
+        // PACKAGE-REF, otherwise every reference using "BaseB" breaks.
+        let model = AutosarModel::new();
+        let result = model.load_buffer(FILEBUF1_COMPLEX_BASES, "test", true);
+        assert!(result.is_ok());
+        let (el_ref_base_b, el_ref_base_c) = get_complex_bases_refs(&model);
+        let el_ecu = el_ref_base_b.get_reference_target().unwrap();
+
+        let el_subpackage = model.get_element_by_path("/ContentPkg/SubPackage").unwrap();
+        el_subpackage.set_item_name("SubPkgX").unwrap();
+
+        let el_package_ref = model
+            .get_element_by_path("/BasesPkg/SubPackage")
+            .and_then(|el_package| el_package.get_sub_element(ElementName::ReferenceBases))
+            .and_then(|el_bases| el_bases.get_sub_element_at(0))
+            .and_then(|el_base| el_base.get_sub_element(ElementName::PackageRef))
+            .unwrap();
+        assert_eq!(
+            el_package_ref.character_data().unwrap().string_value().unwrap(),
+            "SubPkgX"
+        );
+        // the chained reference base now resolves to the renamed package
+        assert_eq!(
+            el_package_ref.resolve_reference_base("BaseB").as_deref(),
+            Some("/ContentPkg/SubPkgX")
+        );
+
+        // the relative path of the reference is unchanged, but it now resolves through the new base path
+        assert_eq!(el_ref_base_b.character_data().unwrap().string_value().unwrap(), "Ecu");
+        assert_eq!(el_ref_base_b.get_reference_target().unwrap(), el_ecu);
+        assert_eq!(el_ecu.path().unwrap(), "/ContentPkg/SubPkgX/Ecu");
+        assert_eq!(
+            el_ref_base_c.get_reference_target().unwrap().path().unwrap(),
+            "/ContentPkg2/Ecu"
+        );
+        assert_eq!(model.get_references_to("/ContentPkg/SubPkgX/Ecu").len(), 1);
+        assert_eq!(model.get_references_to("/ContentPkg/SubPkgX").len(), 1);
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn reference_base_scope_respects_path_boundaries() {
+        // A reference base is in scope for the package which declares it and for all packages
+        // nested inside it. "/Pkg10" is not nested inside "/Pkg1", even though "/Pkg10" starts with
+        // the string "/Pkg1", so the base declared by "/Pkg1" must not be usable from "/Pkg10".
+        const FILEBUF: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+<AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <AR-PACKAGES>
+    <AR-PACKAGE><SHORT-NAME>Pkg1</SHORT-NAME>
+      <REFERENCE-BASES>
+        <REFERENCE-BASE>
+          <SHORT-LABEL>Base</SHORT-LABEL>
+          <PACKAGE-REF DEST="AR-PACKAGE">/Target</PACKAGE-REF>
+        </REFERENCE-BASE>
+      </REFERENCE-BASES>
+      <ELEMENTS>
+        <SYSTEM><SHORT-NAME>System</SHORT-NAME>
+          <FIBEX-ELEMENTS>
+            <FIBEX-ELEMENT-REF-CONDITIONAL>
+              <FIBEX-ELEMENT-REF DEST="ECU-INSTANCE" BASE="Base">Ecu</FIBEX-ELEMENT-REF>
+            </FIBEX-ELEMENT-REF-CONDITIONAL>
+          </FIBEX-ELEMENTS>
+        </SYSTEM>
+      </ELEMENTS>
+      <AR-PACKAGES>
+        <AR-PACKAGE><SHORT-NAME>Sub</SHORT-NAME>
+          <ELEMENTS>
+            <SYSTEM><SHORT-NAME>System</SHORT-NAME>
+              <FIBEX-ELEMENTS>
+                <FIBEX-ELEMENT-REF-CONDITIONAL>
+                  <FIBEX-ELEMENT-REF DEST="ECU-INSTANCE" BASE="Base">Ecu</FIBEX-ELEMENT-REF>
+                </FIBEX-ELEMENT-REF-CONDITIONAL>
+              </FIBEX-ELEMENTS>
+            </SYSTEM>
+          </ELEMENTS>
+        </AR-PACKAGE>
+      </AR-PACKAGES>
+    </AR-PACKAGE>
+    <AR-PACKAGE><SHORT-NAME>Pkg10</SHORT-NAME>
+      <ELEMENTS>
+        <SYSTEM><SHORT-NAME>System</SHORT-NAME>
+          <FIBEX-ELEMENTS>
+            <FIBEX-ELEMENT-REF-CONDITIONAL>
+              <FIBEX-ELEMENT-REF DEST="ECU-INSTANCE" BASE="Base">Ecu</FIBEX-ELEMENT-REF>
+            </FIBEX-ELEMENT-REF-CONDITIONAL>
+          </FIBEX-ELEMENTS>
+        </SYSTEM>
+      </ELEMENTS>
+    </AR-PACKAGE>
+    <AR-PACKAGE><SHORT-NAME>Target</SHORT-NAME>
+      <ELEMENTS>
+        <ECU-INSTANCE><SHORT-NAME>Ecu</SHORT-NAME></ECU-INSTANCE>
+      </ELEMENTS>
+    </AR-PACKAGE>
+  </AR-PACKAGES>
+</AUTOSAR>"#.as_bytes();
+        let model = AutosarModel::new();
+        model.load_buffer(FILEBUF, "test", true).unwrap();
+
+        let get_reference = |system_path: &str| {
+            model
+                .get_element_by_path(system_path)
+                .and_then(|e| e.get_sub_element(ElementName::FibexElements))
+                .and_then(|e| e.get_sub_element_at(0))
+                .and_then(|e| e.get_sub_element(ElementName::FibexElementRef))
+                .unwrap()
+        };
+
+        // the declaring package itself: in scope
+        let el_declaring = get_reference("/Pkg1/System");
+        assert_eq!(el_declaring.resolve_reference_base("Base").as_deref(), Some("/Target"));
+        assert_eq!(
+            el_declaring.get_reference_target().unwrap().path().unwrap(),
+            "/Target/Ecu"
+        );
+        // nested inside the declaring package: in scope
+        let el_nested = get_reference("/Pkg1/Sub/System");
+        assert_eq!(el_nested.resolve_reference_base("Base").as_deref(), Some("/Target"));
+        assert_eq!(el_nested.get_reference_target().unwrap().path().unwrap(), "/Target/Ecu");
+        // a sibling package whose name merely starts with the same characters: not in scope, so the
+        // relative reference in /Pkg10 cannot be resolved
+        let el_sibling = get_reference("/Pkg10/System");
+        assert_eq!(el_sibling.resolve_reference_base("Base"), None);
+        assert!(el_sibling.get_reference_target().is_err());
+
+        assert_eq!(model.check_references().len(), 1);
+        assert_eq!(model.get_references_to("/Target/Ecu").len(), 2);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn cyclic_reference_base_terminates() {
+        // A REFERENCE-BASE may use another REFERENCE-BASE as its own base. Invalid data can make
+        // that chain cyclic; resolving such a base must fail instead of looping forever.
+        const FILEBUF: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+<AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <AR-PACKAGES>
+    <AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME>
+      <REFERENCE-BASES>
+        <REFERENCE-BASE>
+          <SHORT-LABEL>SelfRef</SHORT-LABEL>
+          <PACKAGE-REF DEST="AR-PACKAGE" BASE="SelfRef">Sub</PACKAGE-REF>
+        </REFERENCE-BASE>
+        <REFERENCE-BASE>
+          <SHORT-LABEL>MutualA</SHORT-LABEL>
+          <PACKAGE-REF DEST="AR-PACKAGE" BASE="MutualB">SubA</PACKAGE-REF>
+        </REFERENCE-BASE>
+        <REFERENCE-BASE>
+          <SHORT-LABEL>MutualB</SHORT-LABEL>
+          <PACKAGE-REF DEST="AR-PACKAGE" BASE="MutualA">SubB</PACKAGE-REF>
+        </REFERENCE-BASE>
+      </REFERENCE-BASES>
+      <ELEMENTS>
+        <SYSTEM><SHORT-NAME>System</SHORT-NAME>
+          <FIBEX-ELEMENTS>
+            <FIBEX-ELEMENT-REF-CONDITIONAL>
+              <FIBEX-ELEMENT-REF DEST="ECU-INSTANCE" BASE="SelfRef">Ecu</FIBEX-ELEMENT-REF>
+            </FIBEX-ELEMENT-REF-CONDITIONAL>
+            <FIBEX-ELEMENT-REF-CONDITIONAL>
+              <FIBEX-ELEMENT-REF DEST="ECU-INSTANCE" BASE="MutualA">Ecu</FIBEX-ELEMENT-REF>
+            </FIBEX-ELEMENT-REF-CONDITIONAL>
+          </FIBEX-ELEMENTS>
+        </SYSTEM>
+      </ELEMENTS>
+    </AR-PACKAGE>
+  </AR-PACKAGES>
+</AUTOSAR>"#.as_bytes();
+        let model = AutosarModel::new();
+        model.load_buffer(FILEBUF, "test", true).unwrap();
+
+        let el_fibex_elements = model
+            .get_element_by_path("/Pkg/System")
+            .and_then(|e| e.get_sub_element(ElementName::FibexElements))
+            .unwrap();
+        let mut references = el_fibex_elements
+            .sub_elements()
+            .filter_map(|ferc| ferc.get_sub_element(ElementName::FibexElementRef));
+        // a reference base which is its own base
+        let el_self_cycle = references.next().unwrap();
+        assert_eq!(el_self_cycle.resolve_reference_base("SelfRef"), None);
+        assert!(el_self_cycle.get_reference_target().is_err());
+        // two reference bases which are each other's base
+        let el_mutual_cycle = references.next().unwrap();
+        assert_eq!(el_mutual_cycle.resolve_reference_base("MutualA"), None);
+        assert!(el_mutual_cycle.get_reference_target().is_err());
+
+        // the two references above, plus the three PACKAGE-REFs, which are themselves relative
+        // references that cannot be resolved because of the cycles they are part of
+        assert_eq!(model.check_references().len(), 5);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn load_duplicate_reference_bases() {
+        // An AR-PACKAGE may be split across several files, each of them repeating the same
+        // REFERENCE-BASE. The merge keeps only one REFERENCE-BASE element, so the cache must not
+        // contain a duplicate entry either - otherwise removing the element would leave a stale
+        // entry behind which still resolves references.
+        const FILEBUF: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+<AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <AR-PACKAGES>
+    <AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME>
+      <REFERENCE-BASES>
+        <REFERENCE-BASE>
+          <SHORT-LABEL>Base</SHORT-LABEL>
+          <PACKAGE-REF DEST="AR-PACKAGE">/Target</PACKAGE-REF>
+        </REFERENCE-BASE>
+      </REFERENCE-BASES>
+    </AR-PACKAGE>
+  </AR-PACKAGES>
+</AUTOSAR>"#.as_bytes();
+        let model = AutosarModel::new();
+        model.load_buffer(FILEBUF, "file1", true).unwrap();
+        model.load_buffer(FILEBUF, "file2", true).unwrap();
+
+        // the merge keeps a single REFERENCE-BASE element, and the reference resolves through it
+        let el_reference_bases = model
+            .get_element_by_path("/Pkg")
+            .and_then(|e| e.get_sub_element(ElementName::ReferenceBases))
+            .unwrap();
+        assert_eq!(el_reference_bases.sub_elements().count(), 1);
+        let el_package_ref = el_reference_bases
+            .get_sub_element_at(0)
+            .and_then(|e| e.get_sub_element(ElementName::PackageRef))
+            .unwrap();
+        assert_eq!(
+            el_package_ref.resolve_reference_base("Base").as_deref(),
+            Some("/Target")
+        );
+
+        // removing that element removes the declaration for good
+        let el_package = model.get_element_by_path("/Pkg").unwrap();
+        el_package.remove_sub_element(el_reference_bases).unwrap();
+        assert_eq!(el_package_ref.resolve_reference_base("Base"), None);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn duplicate_model_resolves_relative_references() {
+        // AutosarModel::duplicate() copies the element tree into a new model, so the relative references
+        // in the copy must be resolved against the reference bases of the copy
+        let model = AutosarModel::new();
+        model.load_buffer(FILEBUF1_COMPLEX_BASES, "test", true).unwrap();
+        let copy = model.duplicate().unwrap();
+
+        let el_fibex_element_ref = copy
+            .get_element_by_path("/BasesPkg/SubPackage/System")
+            .and_then(|e| e.get_sub_element(ElementName::FibexElements))
+            .and_then(|e| e.get_sub_element_at(0))
+            .and_then(|e| e.get_sub_element(ElementName::FibexElementRef))
+            .unwrap();
+        assert_eq!(
+            el_fibex_element_ref.get_reference_target().unwrap().path().unwrap(),
+            "/ContentPkg/SubPackage/Ecu"
+        );
+        assert!(copy.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 }

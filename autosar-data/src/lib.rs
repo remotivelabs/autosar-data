@@ -110,12 +110,8 @@ pub use autosar_data_specification::EnumItem;
 
 type FxIndexMap<K, V> = IndexMap<K, V, FxBuildHasher>;
 
-#[derive(Debug, Clone)]
-pub(crate) struct ReferenceBaseInfo {
-    pub(crate) owner_package_path: String,
-    pub(crate) package_ref: String,
-    pub(crate) package_ref_base: Option<String>,
-}
+// internal helpers for keeping the path-derived caches of the model consistent
+pub(crate) use autosarmodel::PathRemap;
 
 /// `AutosarModel` is the top level data type in the autosar-data crate.
 ///
@@ -145,12 +141,19 @@ pub(crate) struct AutosarModelRaw {
     files: Arc<parking_lot::Mutex<Vec<ArxmlFile>>>,
     /// `identifiables` is a `HashMap` of all named elements, needed to resolve references without doing a full search.
     identifiables: FxIndexMap<String, WeakElement>,
-    /// `reference_origins` is a `HashMap` of all referencing elements.
-    reference_origins: FxHashMap<String, Vec<WeakElement>>,
-    /// `relative_reference_origins` is a `HashMap` of all referencing elements with relative paths.
-    relative_reference_origins: FxHashMap<String, Vec<(WeakElement, String)>>, // Relative path -> [(referencing element, base label)]*
-    /// `reference_bases` stores all REFERENCE-BASE declarations indexed by short label.
-    reference_bases: FxHashMap<String, Vec<ReferenceBaseInfo>>,
+    /// `reference_origins` is a `HashMap` of all referencing elements, both absolute and relative ones,
+    /// indexed by the absolute Autosar path of the element they refer to. For an absolute reference that
+    /// is simply its character data; for a relative reference it is the result of resolving the relative
+    /// path against the reference base named by its BASE attribute.
+    reference_origins: FxHashMap<String, Vec<WeakElement>>, // target path -> [referencing element]*
+    /// `relative_references` maps each referencing element which has a BASE attribute to the key it is
+    /// currently registered under in `reference_origins`. The value is `None` while its reference base
+    /// is not in scope: such a reference has no target path, and is absent from `reference_origins`.
+    ///
+    /// This reverse index exists because the target path of a relative reference frequently cannot be
+    /// recomputed at the moment it is needed: de-registration happens while element locks are held and
+    /// after the element has been detached from the tree, when its base can no longer be resolved.
+    relative_references: FxHashMap<WeakElement, Option<String>>, // referencing element -> target path
 }
 
 /// The error type `AutosarDataError` wraps all errors that can be generated anywhere in the crate

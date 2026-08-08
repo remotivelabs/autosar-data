@@ -583,9 +583,14 @@ impl Element {
         }
         let model = self.model()?;
         let version = self.min_version()?;
-        self.0
+        let copy = self
+            .0
             .write()
-            .create_copied_sub_element(self.downgrade(), other, &model, version)
+            .create_copied_sub_element(self.downgrade(), other, &model, version);
+        // the copy may contain relative references and REFERENCE-BASE declarations, neither of which
+        // could be resolved while the element was being copied
+        model.resolve_relative_references();
+        copy
     }
 
     /// Create a deep copy of the given element and insert it as a sub-element at the given position
@@ -638,9 +643,14 @@ impl Element {
         }
         let model = self.model()?;
         let version = self.min_version()?;
-        self.0
+        let copy = self
+            .0
             .write()
-            .create_copied_sub_element_at(self.downgrade(), other, position, &model, version)
+            .create_copied_sub_element_at(self.downgrade(), other, position, &model, version);
+        // the copy may contain relative references and REFERENCE-BASE declarations, neither of which
+        // could be resolved while the element was being copied
+        model.resolve_relative_references();
+        copy
     }
 
     /// Take an `element` from it's current location and place it in this element as a sub element
@@ -694,9 +704,15 @@ impl Element {
                 version_new: version_src,
             });
         }
-        self.0
+        let moved = self
+            .0
             .write()
-            .move_element_here(self.downgrade(), move_element, &model, &model_src, version)
+            .move_element_here(self.downgrade(), move_element, &model, &model_src, version);
+        // the moved elements may contain relative references which are now in the scope of different
+        // reference bases, and they may declare reference bases themselves
+        model_src.resolve_relative_references();
+        model.resolve_relative_references();
+        moved
     }
 
     /// Take an `element` from it's current location and place it at the given position in this element as a sub element
@@ -751,9 +767,15 @@ impl Element {
                 version_new: version_src,
             });
         }
-        self.0
-            .write()
-            .move_element_here_at(self.downgrade(), move_element, position, &model, &model_src, version)
+        let moved =
+            self.0
+                .write()
+                .move_element_here_at(self.downgrade(), move_element, position, &model, &model_src, version);
+        // the moved elements may contain relative references which are now in the scope of different
+        // reference bases, and they may declare reference bases themselves
+        model_src.resolve_relative_references();
+        model.resolve_relative_references();
+        moved
     }
 
     /// Remove the sub element `sub_element`
@@ -792,7 +814,10 @@ impl Element {
             });
         }
         let model = self.model()?;
-        self.0.write().remove_sub_element(sub_element, &model)
+        let result = self.0.write().remove_sub_element(sub_element, &model);
+        // removing a REFERENCE-BASE changes what the relative references in its scope resolve to
+        model.resolve_relative_references();
+        result
     }
 
     /// Remove a sub element identified by an ElementName
@@ -869,7 +894,12 @@ impl Element {
     ///  - [`AutosarDataError::ElementNotIdentifiable`]: The target element is not identifiable, so it cannot be referenced by an Autosar path
     ///  - [`AutosarDataError::NoFilesInModel`]: The operation cannot be completed because the model does not contain any files
     pub fn set_reference_target(&self, target: &Element) -> Result<(), AutosarDataError> {
-        self.set_reference_target_internal(target, None)
+        let result = self.set_reference_target_internal(target, None);
+        // the reference is registered while this element is locked, so it can only be resolved here
+        if let Ok(model) = self.model() {
+            model.resolve_relative_references();
+        }
+        result
     }
 
     /// Set the reference target using a relative path and explicit BASE label
@@ -888,7 +918,126 @@ impl Element {
     ///  - [`AutosarDataError::ElementNotIdentifiable`]: The target element is not identifiable, so it cannot be referenced by an Autosar path
     ///  - [`AutosarDataError::NoFilesInModel`]: The operation cannot be completed because the model does not contain any files
     pub fn set_relative_reference_target(&self, target: &Element, base_label: &str) -> Result<(), AutosarDataError> {
-        self.set_reference_target_internal(target, Some(base_label))
+        let result = self.set_reference_target_internal(target, Some(base_label));
+        // the reference is registered while this element is locked, so it can only be resolved here
+        if let Ok(model) = self.model() {
+            model.resolve_relative_references();
+        }
+        result
+    }
+
+    /// Resolve the reference base named `label`, for a relative reference located in this element
+    ///
+    /// A REFERENCE-BASE is declared by an AR-PACKAGE, and it is in scope for that package as well as for
+    /// everything nested inside it. The applicable declaration is therefore found by walking up the
+    /// ancestor packages of the reference and taking the first one which declares `label`.
+    ///
+    /// The PACKAGE-REF of a REFERENCE-BASE may carry a BASE attribute of its own, i.e. it can be
+    /// relative to another reference base. It is then resolved in the scope of the package which
+    /// declares it, and the two paths are joined. Invalid data can make this chain cyclic, so the
+    /// declarations which have already been visited are tracked in order to avoid looping forever.
+    ///
+    /// The result is `None` if the label is not in scope, if this element is not inside a package, or if
+    /// an element lock could not be acquired: this reads the element tree while the caller may hold the
+    /// model lock, so every element lock is taken with a timeout.
+    pub(crate) fn resolve_reference_base(&self, label: &str) -> Option<String> {
+        let mut search_package = self.package().ok().flatten()?;
+        let mut label = label.to_owned();
+        // the path components contributed by the chained reference bases, innermost first
+        let mut relative_parts: Vec<String> = Vec::new();
+        let mut visited: Vec<(Element, String)> = Vec::new();
+
+        loop {
+            let (declaring_package, package_ref, package_ref_base) =
+                Self::find_reference_base_declaration(&search_package, &label)?;
+            if visited.contains(&(declaring_package.clone(), label.clone())) {
+                // a cycle in the chain of reference bases - the base cannot be resolved
+                return None;
+            }
+            visited.push((declaring_package.clone(), label));
+
+            let Some(outer_label) = package_ref_base else {
+                // the end of the chain: this PACKAGE-REF contains an absolute path
+                let mut resolved = package_ref;
+                for part in relative_parts.iter().rev() {
+                    resolved.push('/');
+                    resolved.push_str(part);
+                }
+                return Some(resolved);
+            };
+            relative_parts.push(package_ref);
+            // the BASE attribute of the PACKAGE-REF is resolved in the scope of the package which
+            // declares this reference base
+            search_package = declaring_package;
+            label = outer_label;
+        }
+    }
+
+    /// Resolve this relative reference to the absolute path of the element it refers to
+    ///
+    /// This is the definition of what a relative reference means, and therefore of the key it is
+    /// registered under in the model. The result is `None` if this is not a usable relative reference:
+    /// it has no character data or no BASE attribute, it is not inside a package, or its reference base
+    /// is not in scope.
+    pub(crate) fn resolve_relative_target(&self) -> Option<String> {
+        let reference = self.character_data()?.string_value()?;
+        let base_label = self.attribute_value(AttributeName::Base)?.string_value()?;
+        let base_path = self.resolve_reference_base(&base_label)?;
+        Some(format!("{base_path}/{reference}"))
+    }
+
+    /// Find the nearest declaration of the reference base `label`: `package` itself is searched first,
+    /// followed by its ancestor packages
+    ///
+    /// The result is the declaring package, the character data of its PACKAGE-REF, and the BASE
+    /// attribute of that PACKAGE-REF.
+    fn find_reference_base_declaration(package: &Element, label: &str) -> Option<(Element, String, Option<String>)> {
+        let mut current_package = Some(package.clone());
+        while let Some(package) = current_package {
+            if let Some(reference_bases) = package.try_get_sub_element(ElementName::ReferenceBases) {
+                let declarations: Vec<Element> = reference_bases
+                    .0
+                    .try_read_for(std::time::Duration::from_millis(10))?
+                    .content
+                    .iter()
+                    .filter_map(|item| match item {
+                        ElementContent::Element(sub_element) => Some(sub_element.clone()),
+                        ElementContent::CharacterData(_) => None,
+                    })
+                    .collect();
+                for declaration in declarations {
+                    if let Some((declared_label, package_ref, package_ref_base)) = declaration
+                        .0
+                        .try_read_for(std::time::Duration::from_millis(10))?
+                        .reference_base_declaration()
+                        && declared_label == label
+                    {
+                        return Some((package, package_ref, package_ref_base));
+                    }
+                }
+            }
+            current_package = package.package().ok().flatten();
+        }
+        None
+    }
+
+    /// Get the first sub element with the given name, acquiring every element lock with a timeout
+    ///
+    /// Unlike [`Self::get_sub_element`] this can be used while the model lock is held.
+    fn try_get_sub_element(&self, name: ElementName) -> Option<Element> {
+        let locked_element = self.0.try_read_for(std::time::Duration::from_millis(10))?;
+        for item in &locked_element.content {
+            if let ElementContent::Element(sub_element) = item
+                && sub_element
+                    .0
+                    .try_read_for(std::time::Duration::from_millis(10))?
+                    .elemname
+                    == name
+            {
+                return Some(sub_element.clone());
+            }
+        }
+        None
     }
 
     fn set_reference_target_internal(
@@ -916,9 +1065,8 @@ impl Element {
         let target_string = if let Some(base_label) = base_label {
             // a relative reference can only be resolved if the reference element is inside a package;
             // this is not always the case, e.g. references inside AUTOSAR > ADMIN-DATA are outside any package
-            let ref_package_path = self.package()?.ok_or(AutosarDataError::InvalidReferenceBase)?.path()?;
-            let base_path = model
-                .resolve_reference_base(base_label, &ref_package_path)
+            let base_path = self
+                .resolve_reference_base(base_label)
                 .ok_or(AutosarDataError::InvalidReferenceBase)?;
             let mut trimmed_target_path = new_ref
                 .strip_prefix(&base_path)
@@ -933,24 +1081,6 @@ impl Element {
 
         let version = self.min_version()?;
 
-        // if this is the PACKAGE-REF of a REFERENCE-BASE, then the reference base cache in the model must be
-        // updated. The required info must be gathered before locking self: locking the parent while holding
-        // the element's own write lock could deadlock. Errors are propagated, so that the cache update
-        // cannot be skipped silently.
-        let reference_base_info = if self.element_name() == ElementName::PackageRef
-            && let Some(parent) = self.parent()?
-            && parent.element_name() == ElementName::ReferenceBase
-            && let Some(label) = parent
-                .get_sub_element(ElementName::ShortLabel)
-                .and_then(|e| e.character_data())
-                .and_then(|c| c.string_value())
-            && let Some(package) = parent.package()?
-        {
-            Some((label, package.path()?))
-        } else {
-            None
-        };
-
         let mut element = self.0.write();
         // set the DEST attribute first - this could fail if the target element has the wrong type
         if element
@@ -964,30 +1094,10 @@ impl Element {
 
         // if this reference previously referenced some other element, update
         if let Some(old_ref) = opt_old_ref {
-            let old_base = element
-                .attribute_value(AttributeName::Base)
-                .and_then(|cdata| cdata.string_value());
-            model.fix_reference_origins(
-                &old_ref,
-                &target_string,
-                old_base.as_deref(),
-                base_label,
-                self.downgrade(),
-            );
+            model.fix_reference_origins(&old_ref, &target_string, base_label, self.downgrade());
         } else {
             // else initialise the new reference
             model.add_reference_origin(&target_string, base_label, self.downgrade());
-        }
-
-        // if this is the PackageRef of a ReferenceBase, then we need to update the ReferenceBase index in the model
-        if let Some((label, owner_package_path)) = reference_base_info {
-            model.fix_reference_base(
-                Some(label.clone()),
-                label,
-                target_string.clone(),
-                base_label.map(|s| s.to_string()),
-                owner_package_path,
-            );
         }
 
         // do the update - Note: The update is infallible in practice, since we've constructed a valid target string
@@ -1049,17 +1159,14 @@ impl Element {
             if let Some(CharacterData::String(reference)) = self.character_data() {
                 let model = self.model()?;
 
-                let full_path = if let Some(base_label) = self
-                    .attribute_value(AttributeName::Base)
-                    .and_then(|cdata| cdata.string_value())
-                {
-                    // a relative reference can only be resolved if the reference element is inside a package;
-                    // this is not always the case, e.g. references inside AUTOSAR > ADMIN-DATA are outside any package
-                    let ref_package_path = self.package()?.ok_or(AutosarDataError::InvalidReference)?.path()?;
-                    let reference_base = model
-                        .resolve_reference_base(&base_label, &ref_package_path)
-                        .ok_or(AutosarDataError::InvalidReference)?;
-                    format!("{reference_base}/{reference}")
+                let full_path = if self.attribute_value(AttributeName::Base).is_some() {
+                    // The target path of a relative reference is already known: it is the key that the
+                    // reference is registered under, so its reference base does not have to be resolved
+                    // again here. The path is absent while the base is not in scope, which happens e.g.
+                    // for a reference inside AUTOSAR > ADMIN-DATA, outside of any package.
+                    model
+                        .relative_reference_target(&self.downgrade())
+                        .ok_or(AutosarDataError::InvalidReference)?
                 } else {
                     reference
                 };
@@ -1152,12 +1259,6 @@ impl Element {
                     None
                 };
 
-                let old_label = if self.element_name() == ElementName::ShortLabel {
-                    self.character_data().and_then(|cdata| cdata.string_value())
-                } else {
-                    None
-                };
-
                 // update the character data
                 {
                     let mut element = self.0.write();
@@ -1170,7 +1271,8 @@ impl Element {
                     && let Some(parent) = self.parent()?
                 {
                     let new_path = parent.path()?;
-                    model.fix_identifiables(&prev_path, &new_path);
+                    model.fix_element_paths(&PathRemap::single(prev_path, new_path));
+                    // note: set_character_data explicitly does not adapt references to the renamed element, unlike set_item_name
                 }
 
                 // reference: update the references hashmap in the top-level AutosarModel
@@ -1181,35 +1283,15 @@ impl Element {
                         .attribute_value(AttributeName::Base)
                         .and_then(|cdata| cdata.string_value());
                     if let Some(old_refval) = old_refval {
-                        model.fix_reference_origins(
-                            &old_refval,
-                            &refval,
-                            base.as_deref(),
-                            base.as_deref(),
-                            self.downgrade(),
-                        );
+                        model.fix_reference_origins(&old_refval, &refval, base.as_deref(), self.downgrade());
                     } else {
                         model.add_reference_origin(&refval, base.as_deref(), self.downgrade());
                     }
-                } else if self.element_name() == ElementName::ShortLabel
-                    && let Ok(Some(parent)) = self.parent()
-                    && parent.element_name() == ElementName::ReferenceBase
-                    && let Ok(Some(package)) = parent.package()
-                    && let Ok(owner_package_path) = package.path()
-                {
-                    // setting or updating the label of a ReferenceBase
-                    if let Some(package_ref) = parent.get_sub_element(ElementName::PackageRef)
-                        && let Some(package_ref_val) =
-                            package_ref.character_data().and_then(|cdata| cdata.string_value())
-                    {
-                        let base_attr = package_ref
-                            .attribute_value(AttributeName::Base)
-                            .and_then(|cdata| cdata.string_value());
-                        // obviously the new label exists since we just set it
-                        let new_label = self.character_data().and_then(|cdata| cdata.string_value()).unwrap();
-                        model.fix_reference_base(old_label, new_label, package_ref_val, base_attr, owner_package_path);
-                    }
                 }
+
+                // This may have been a reference, or the SHORT-LABEL or PACKAGE-REF of a
+                // REFERENCE-BASE, which changes what the relative references in its scope resolve to.
+                model.resolve_relative_references();
 
                 return Ok(());
             }
@@ -1256,15 +1338,18 @@ impl Element {
             } else {
                 if self.character_data().is_some() {
                     if self.is_reference() {
+                        // the model is required in order to de-register the reference
                         let model = self.model()?;
                         if let Some(CharacterData::String(reference)) = self.character_data() {
-                            let base = self
-                                .attribute_value(AttributeName::Base)
-                                .and_then(|cdata| cdata.string_value());
-                            model.remove_reference_origin(&reference, base.as_deref(), self.downgrade());
+                            model.remove_reference_origin(&reference, self.downgrade());
                         }
                     }
                     self.0.write().content.clear();
+                    // this may have been the SHORT-LABEL or PACKAGE-REF of a REFERENCE-BASE, which the
+                    // relative references in its scope resolve through
+                    if let Ok(model) = self.model() {
+                        model.resolve_relative_references();
+                    }
                 }
                 Ok(())
             }
@@ -1760,6 +1845,8 @@ impl Element {
     ///  - [`AutosarDataError::InvalidAttribute`]: The `AttributeName` is not valid for this element
     ///  - [`AutosarDataError::InvalidAttributeValue`]: The value is not valid for this attribute in this element
     ///  - [`AutosarDataError::NoFilesInModel`]: The operation cannot be completed because the model does not contain any files
+    ///  - [`AutosarDataError::ParentElementLocked`]: a parent element was locked and did not become available after waiting briefly.
+    ///    This happens while determining the Autosar version of the element, so the attribute has not been set in this case.
     pub fn set_attribute<T: Into<CharacterData>>(
         &self,
         attrname: AttributeName,
@@ -1771,7 +1858,6 @@ impl Element {
         self.0.write().set_attribute_internal(attrname, value.into(), version)?;
 
         self.base_attribute_fixup(attrname, old_base, reference_value);
-
         Ok(())
     }
 
@@ -1796,6 +1882,8 @@ impl Element {
     ///  - [`AutosarDataError::InvalidAttribute`]: The `AttributeName` is not valid for this element
     ///  - [`AutosarDataError::InvalidAttributeValue`]: The value is not valid for this attribute in this element
     ///  - [`AutosarDataError::NoFilesInModel`]: The operation cannot be completed because the model does not contain any files
+    ///  - [`AutosarDataError::ParentElementLocked`]: a parent element was locked and did not become available after waiting briefly.
+    ///    This happens while determining the Autosar version of the element, so the attribute has not been set in this case.
     pub fn set_attribute_string(&self, attrname: AttributeName, stringvalue: &str) -> Result<(), AutosarDataError> {
         let version = self.min_version()?;
         let (old_base, reference_value) = self.base_attribute_info(attrname);
@@ -1804,7 +1892,6 @@ impl Element {
 
         // post-change fixup for BASE attribute changes only
         self.base_attribute_fixup(attrname, old_base, reference_value);
-
         Ok(())
     }
 
@@ -1847,22 +1934,31 @@ impl Element {
         (old_base, reference_value)
     }
 
-    /// fix the reference origins of a reference element if the BASE attribute was changed or removed
+    /// Fix the caches affected by a reference element's BASE attribute being changed or removed
     fn base_attribute_fixup(&self, attrname: AttributeName, old_base: Option<String>, reference_value: Option<String>) {
-        if attrname == AttributeName::Base
-            && let Some(reference_value) = reference_value
+        if attrname != AttributeName::Base {
+            return;
+        }
+        if let Some(reference_value) = reference_value
             && let Ok(model) = self.model()
         {
             let new_base = self
                 .attribute_value(AttributeName::Base)
                 .and_then(|cdata| cdata.string_value());
-            model.fix_reference_origins(
-                &reference_value,
-                &reference_value,
-                old_base.as_deref(),
-                new_base.as_deref(),
-                self.downgrade(),
-            );
+            if old_base != new_base {
+                model.fix_reference_origins(
+                    &reference_value,
+                    &reference_value,
+                    new_base.as_deref(),
+                    self.downgrade(),
+                );
+            }
+        }
+        // The BASE attribute of the PACKAGE-REF of a REFERENCE-BASE selects the reference base that
+        // the PACKAGE-REF is itself relative to, so this can change what the relative references in the
+        // scope of that REFERENCE-BASE resolve to.
+        if let Ok(model) = self.model() {
+            model.resolve_relative_references();
         }
     }
 
@@ -3606,7 +3702,10 @@ mod test {
             .create_sub_element(ElementName::PackageRef)
             .and_then(|package_ref| package_ref.set_reference_target(&el_ar_package))
             .unwrap();
-        assert!(model.0.read().reference_bases.contains_key("default"));
+        assert_eq!(
+            el_reference_base.resolve_reference_base("default").as_deref(),
+            Some("/Package")
+        );
 
         el_fibex_element_ref
             .set_relative_reference_target(&el_ecu_instance2, "default")
@@ -3647,7 +3746,12 @@ mod test {
             .set_attribute(AttributeName::Dest, CharacterData::Enum(EnumItem::ISignal))
             .unwrap();
         assert!(el_fibex_element_ref.get_reference_target().is_err());
-        // invalid reference: no DEST attribute
+        // everything up to this point went through the public API, so the caches must be consistent
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+        // invalid reference: no DEST attribute.
+        // DEST is a required attribute, so remove_attribute() refuses to remove it and the test has to
+        // reach into the element instead. This also drops the BASE attribute, which desynchronizes the
+        // reference caches by design - so verify_reference_caches() must not be called after this.
         el_fibex_element_ref.0.write().attributes.clear(); // remove the DEST attribute
         assert!(el_fibex_element_ref.get_reference_target().is_err());
         el_fibex_element_ref.set_reference_target(&el_ecu_instance2).unwrap();
@@ -3703,6 +3807,7 @@ mod test {
             .unwrap();
         let result = el_sdx_ref.get_reference_target();
         assert!(matches!(result, Err(AutosarDataError::InvalidReference)));
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 
     #[test]
@@ -4597,15 +4702,6 @@ mod test {
         let unit_elem = model.get_element_by_path("/My/Lib/Hierarchy/Units/MyUnit").unwrap();
         assert_eq!(unit_elem.element_name(), ElementName::Unit);
 
-        // verify that the reference base has been correctly parsed and cached
-        assert_eq!(model.0.read().reference_bases.len(), 1);
-        let locked_model = model.0.read();
-        let (rb, rb_infos) = &locked_model.reference_bases.iter().next().unwrap();
-        assert_eq!(*rb, "Units");
-        assert_eq!(rb_infos.len(), 1);
-        assert_eq!(rb_infos[0].package_ref, "/My/Lib/Hierarchy/Units");
-        drop(locked_model);
-
         // verify that we're correctly tracking incoming references to the unit element from the reference base
         let refs_to_unit = model.get_references_to(&unit_elem.path().unwrap());
         assert_eq!(refs_to_unit.len(), 1);
@@ -4613,9 +4709,16 @@ mod test {
         assert_eq!(reference_elem.element_name(), ElementName::UnitRef);
         assert!(reference_elem.attribute_value(AttributeName::Base).is_some());
 
+        // verify that the reference base has been parsed correctly
+        assert_eq!(
+            reference_elem.resolve_reference_base("Units").as_deref(),
+            Some("/My/Lib/Hierarchy/Units")
+        );
+
         // verify that we can navigate from the reference element to the target unit element
         let target = reference_elem.get_reference_target().unwrap();
         assert_eq!(target, unit_elem);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 
     #[test]
@@ -4680,6 +4783,7 @@ mod test {
         ref_elem.set_relative_reference_target(&ecu_elem, "Second").unwrap();
         assert_eq!(ref_elem.character_data().unwrap().string_value().unwrap(), "Ecu");
         assert_eq!(model.get_references_to(&ecu_elem.path().unwrap()).len(), 1);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 
     #[test]
@@ -4698,53 +4802,63 @@ mod test {
         let el_reference_base = el_reference_bases
             .create_sub_element(ElementName::ReferenceBase)
             .unwrap();
-        // no cached reference base, because label and packageref are missing
-        assert_eq!(model.0.read().reference_bases.len(), 0);
+        // the reference base is unusable, because label and packageref are missing
+        assert_eq!(el_reference_base.resolve_reference_base("Units"), None);
         let el_short_label = el_reference_base.create_sub_element(ElementName::ShortLabel).unwrap();
         el_short_label.set_character_data("Units").unwrap();
-        // no cached reference base, because packageref is missing
-        assert_eq!(model.0.read().reference_bases.len(), 0);
+        // still unusable, because packageref is missing
+        assert_eq!(el_reference_base.resolve_reference_base("Units"), None);
         let el_package_ref = el_reference_base.create_sub_element(ElementName::PackageRef).unwrap();
         el_package_ref.set_reference_target(&el_ar_package2).unwrap();
-        // cached reference base should be created now
-        assert_eq!(model.0.read().reference_bases.len(), 1);
+        // the declaration is complete now, so the base can be resolved
+        assert_eq!(
+            el_reference_base.resolve_reference_base("Units").as_deref(),
+            Some("/Pkg2")
+        );
 
         el_short_label.set_character_data("Modified").unwrap();
-        // cached reference base should be updated with the new label
-        let locked_model = model.0.read();
-        let (rb, rb_infos) = &locked_model.reference_bases.iter().next().unwrap();
-        assert_eq!(*rb, "Modified");
-        assert_eq!(rb_infos[0].package_ref, "/Pkg2");
-        assert_eq!(rb_infos.len(), 1);
-        drop(locked_model);
+        // the base is now declared under the new label
+        assert_eq!(el_reference_base.resolve_reference_base("Units"), None);
+        assert_eq!(
+            el_reference_base.resolve_reference_base("Modified").as_deref(),
+            Some("/Pkg2")
+        );
 
         el_package_ref.set_reference_target(&el_ar_package).unwrap();
-        // cached reference base should be updated with the new package ref
-        let locked_model = model.0.read();
-        let (rb, rb_infos) = &locked_model.reference_bases.iter().next().unwrap();
-        assert_eq!(*rb, "Modified");
-        assert_eq!(rb_infos[0].package_ref, "/Pkg");
-        drop(locked_model);
+        // the base points at the new package
+        assert_eq!(
+            el_reference_base.resolve_reference_base("Modified").as_deref(),
+            Some("/Pkg")
+        );
 
         el_reference_base.remove_sub_element(el_package_ref).unwrap();
-        // cached reference base should be removed again
-        assert_eq!(model.0.read().reference_bases.len(), 0);
+        // unusable again, because the packageref is gone
+        assert_eq!(el_reference_base.resolve_reference_base("Modified"), None);
         // create it again
         let el_package_ref = el_reference_base.create_sub_element(ElementName::PackageRef).unwrap();
         el_package_ref.set_reference_target(&el_ar_package2).unwrap();
-        assert_eq!(model.0.read().reference_bases.len(), 1);
+        assert_eq!(
+            el_reference_base.resolve_reference_base("Modified").as_deref(),
+            Some("/Pkg2")
+        );
         // remove the SHORT-LABEL
         el_reference_base.remove_sub_element(el_short_label).unwrap();
-        // cached reference base should be removed again, because the label is missing
-        assert_eq!(model.0.read().reference_bases.len(), 0);
+        // unusable again, because the label is missing
+        assert_eq!(el_reference_base.resolve_reference_base("Modified"), None);
         let el_short_label = el_reference_base.create_sub_element(ElementName::ShortLabel).unwrap();
         el_short_label.set_character_data("Units").unwrap();
-        // cached reference base should be created again
-        assert_eq!(model.0.read().reference_bases.len(), 1);
+        // usable again, under the label it was just given
+        assert_eq!(
+            el_reference_base.resolve_reference_base("Units").as_deref(),
+            Some("/Pkg2")
+        );
 
-        el_reference_bases.remove_sub_element(el_reference_base).unwrap();
-        // cached reference base should be removed again, because the reference base itself is removed
-        assert_eq!(model.0.read().reference_bases.len(), 0);
+        el_reference_bases
+            .remove_sub_element(el_reference_base.clone())
+            .unwrap();
+        // the declaration is gone with the element
+        assert_eq!(el_reference_base.resolve_reference_base("Units"), None);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 
     #[test]
@@ -4803,20 +4917,30 @@ mod test {
             .and_then(|p| p.set_reference_target(&target2))
             .unwrap();
 
-        assert_eq!(model.0.read().reference_bases.get("Shared").unwrap().len(), 2);
+        // both packages declare "Shared", and each one sees only its own declaration
+        assert_eq!(
+            short_label_1.resolve_reference_base("Shared").as_deref(),
+            Some("/Target1")
+        );
+        assert_eq!(
+            owner2_reference_base.resolve_reference_base("Shared").as_deref(),
+            Some("/Target2")
+        );
 
         short_label_1.set_character_data("Renamed").unwrap();
 
-        let data = model.0.read();
-        let shared_entries = data.reference_bases.get("Shared").unwrap();
-        assert_eq!(shared_entries.len(), 1);
-        assert_eq!(shared_entries[0].owner_package_path, "/Owner2");
-        assert_eq!(shared_entries[0].package_ref, "/Target2");
-
-        let renamed_entries = data.reference_bases.get("Renamed").unwrap();
-        assert_eq!(renamed_entries.len(), 1);
-        assert_eq!(renamed_entries[0].owner_package_path, "/Owner1");
-        assert_eq!(renamed_entries[0].package_ref, "/Target1");
+        // only the declaration in /Owner1 was renamed
+        assert_eq!(short_label_1.resolve_reference_base("Shared"), None);
+        assert_eq!(
+            short_label_1.resolve_reference_base("Renamed").as_deref(),
+            Some("/Target1")
+        );
+        assert_eq!(
+            owner2_reference_base.resolve_reference_base("Shared").as_deref(),
+            Some("/Target2")
+        );
+        assert_eq!(owner2_reference_base.resolve_reference_base("Renamed"), None);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 
     #[test]
@@ -4875,8 +4999,689 @@ mod test {
 
         ref_elem.set_attribute_string(AttributeName::Base, "B").unwrap();
 
-        let origins = model.0.read().relative_reference_origins.get("Ecu").unwrap().clone();
-        let ref_origin = ref_elem.downgrade();
-        assert!(origins.iter().any(|(elem, base)| *elem == ref_origin && base == "B"));
+        // switching the BASE attribute re-resolves the reference: "Ecu" relative to base "B" is
+        // /BaseB/Ecu, so that is the target path it is now registered under
+        assert_eq!(
+            model.relative_reference_target(&ref_elem.downgrade()).as_deref(),
+            Some("/BaseB/Ecu")
+        );
+        assert_eq!(model.get_references_to("/BaseB/Ecu").len(), 1);
+        assert!(model.get_references_to("/BaseA/Ecu").is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    // helper for the reference base removal tests: create a REFERENCE-BASE with the given label
+    // inside owner_package, pointing at target_package
+    fn create_reference_base(owner_package: &Element, label: &str, target_package: &Element) {
+        let el_reference_base = owner_package
+            .get_or_create_sub_element(ElementName::ReferenceBases)
+            .and_then(|e| e.create_sub_element(ElementName::ReferenceBase))
+            .unwrap();
+        el_reference_base
+            .create_sub_element(ElementName::ShortLabel)
+            .and_then(|e| e.set_character_data(label))
+            .unwrap();
+        el_reference_base
+            .create_sub_element(ElementName::PackageRef)
+            .and_then(|e| e.set_reference_target(target_package))
+            .unwrap();
+    }
+
+    // helper for the reference base removal tests: build a model containing the package
+    // "/Outer/Owner", which declares two reference bases pointing at "/Target"
+    fn build_reference_base_model() -> (AutosarModel, Element, Element) {
+        let model = AutosarModel::new();
+        model.create_file("test", AutosarVersion::LATEST).unwrap();
+        let el_ar_packages = model
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .unwrap();
+        let el_target = el_ar_packages
+            .create_named_sub_element(ElementName::ArPackage, "Target")
+            .unwrap();
+        // the owner package is nested inside another package, so that the tests also verify that the
+        // full path of the owner package is used, and not just the name of the innermost package
+        let el_owner = el_ar_packages
+            .create_named_sub_element(ElementName::ArPackage, "Outer")
+            .and_then(|e| e.create_sub_element(ElementName::ArPackages))
+            .and_then(|e| e.create_named_sub_element(ElementName::ArPackage, "Owner"))
+            .unwrap();
+        create_reference_base(&el_owner, "BaseA", &el_target);
+        create_reference_base(&el_owner, "BaseB", &el_target);
+        // an element inside the owner package, from which the reference bases it declares are in scope
+        let el_inside_owner = el_owner
+            .create_sub_element(ElementName::Elements)
+            .and_then(|e| e.create_named_sub_element(ElementName::System, "System"))
+            .unwrap();
+
+        assert_eq!(
+            el_inside_owner.resolve_reference_base("BaseA").as_deref(),
+            Some("/Target")
+        );
+        assert_eq!(
+            el_inside_owner.resolve_reference_base("BaseB").as_deref(),
+            Some("/Target")
+        );
+
+        (model, el_owner, el_inside_owner)
+    }
+
+    #[test]
+    fn remove_reference_bases_element() {
+        // removing the REFERENCE-BASES element removes every reference base declared inside it
+        let (model, el_owner, el_inside_owner) = build_reference_base_model();
+        let el_reference_bases = el_owner.get_sub_element(ElementName::ReferenceBases).unwrap();
+        el_owner.remove_sub_element(el_reference_bases).unwrap();
+        assert_eq!(el_inside_owner.resolve_reference_base("BaseA"), None);
+        assert_eq!(el_inside_owner.resolve_reference_base("BaseB"), None);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn remove_reference_base_owner_package() {
+        // Removing the AR-PACKAGE which owns the reference bases takes the declarations with it. A
+        // reference base is only in scope inside its declaring package, so everything which could have
+        // used it is removed at the same time.
+        let (model, el_owner, el_inside_owner) = build_reference_base_model();
+        let el_ar_packages = el_owner.parent().unwrap().unwrap();
+        el_ar_packages.remove_sub_element(el_owner).unwrap();
+        assert_eq!(el_inside_owner.resolve_reference_base("BaseA"), None);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn remove_reference_base_ancestor() {
+        // removing any element above the reference bases takes the declarations with it, no matter how
+        // far up the hierarchy it is
+        let (model, _el_owner, el_inside_owner) = build_reference_base_model();
+        let el_ar_packages = model.root_element().get_sub_element(ElementName::ArPackages).unwrap();
+        model.root_element().remove_sub_element(el_ar_packages).unwrap();
+        assert_eq!(el_inside_owner.resolve_reference_base("BaseA"), None);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn remove_reference_base_short_label_character_data() {
+        // removing the character data of the SHORT-LABEL leaves the REFERENCE-BASE without a label,
+        // so it can no longer be used and must be removed from the cache
+        let (model, el_owner, el_inside_owner) = build_reference_base_model();
+        let el_short_label = el_owner
+            .get_sub_element(ElementName::ReferenceBases)
+            .and_then(|e| e.get_sub_element(ElementName::ReferenceBase))
+            .and_then(|e| e.get_sub_element(ElementName::ShortLabel))
+            .unwrap();
+        assert_eq!(
+            el_short_label.character_data().unwrap().string_value().unwrap(),
+            "BaseA"
+        );
+        el_short_label.remove_character_data().unwrap();
+
+        assert_eq!(el_inside_owner.resolve_reference_base("BaseA"), None);
+        assert_eq!(
+            el_inside_owner.resolve_reference_base("BaseB").as_deref(),
+            Some("/Target")
+        );
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn remove_reference_base_package_ref_character_data() {
+        // removing the character data of the PACKAGE-REF leaves the REFERENCE-BASE without a target,
+        // so it can no longer be used
+        let (model, el_owner, el_inside_owner) = build_reference_base_model();
+        let el_package_ref = el_owner
+            .get_sub_element(ElementName::ReferenceBases)
+            .and_then(|e| e.get_sub_element(ElementName::ReferenceBase))
+            .and_then(|e| e.get_sub_element(ElementName::PackageRef))
+            .unwrap();
+        assert_eq!(
+            el_package_ref.character_data().unwrap().string_value().unwrap(),
+            "/Target"
+        );
+        el_package_ref.remove_character_data().unwrap();
+
+        assert_eq!(el_inside_owner.resolve_reference_base("BaseA"), None);
+        assert_eq!(
+            el_inside_owner.resolve_reference_base("BaseB").as_deref(),
+            Some("/Target")
+        );
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    // helper for the rename/move tests: get the PACKAGE-REF of the first REFERENCE-BASE of a package
+    fn get_package_ref(owner_package: &Element) -> Element {
+        owner_package
+            .get_sub_element(ElementName::ReferenceBases)
+            .and_then(|e| e.get_sub_element(ElementName::ReferenceBase))
+            .and_then(|e| e.get_sub_element(ElementName::PackageRef))
+            .unwrap()
+    }
+
+    // helper for the rename/move tests: the path which the reference base used by `reference` resolves
+    // to, i.e. the path that the relative content of the reference is interpreted against
+    fn resolved_reference_base(reference: &Element) -> Option<String> {
+        let base_label = reference
+            .attribute_value(AttributeName::Base)
+            .and_then(|cdata| cdata.string_value())?;
+        reference.resolve_reference_base(&base_label)
+    }
+
+    // helper for the rename/move tests: create a package containing an ECU-INSTANCE named "Ecu"
+    fn create_target_package(ar_packages: &Element, name: &str) -> (Element, Element) {
+        let el_package = ar_packages
+            .create_named_sub_element(ElementName::ArPackage, name)
+            .unwrap();
+        let el_ecu = el_package
+            .create_sub_element(ElementName::Elements)
+            .and_then(|e| e.create_named_sub_element(ElementName::EcuInstance, "Ecu"))
+            .unwrap();
+        (el_package, el_ecu)
+    }
+
+    // helper for the rename/move tests: create a FIBEX-ELEMENT-REF inside a new package
+    fn create_relative_reference(
+        ar_packages: &Element,
+        package_name: &str,
+        target: &Element,
+        base_label: &str,
+    ) -> Element {
+        let el_ref = ar_packages
+            .create_named_sub_element(ElementName::ArPackage, package_name)
+            .and_then(|e| e.create_sub_element(ElementName::Elements))
+            .and_then(|e| e.create_named_sub_element(ElementName::System, "System"))
+            .and_then(|e| e.create_sub_element(ElementName::FibexElements))
+            .and_then(|e| e.create_sub_element(ElementName::FibexElementRefConditional))
+            .and_then(|e| e.create_sub_element(ElementName::FibexElementRef))
+            .unwrap();
+        el_ref.set_relative_reference_target(target, base_label).unwrap();
+        el_ref
+    }
+
+    // helper for the rename/move tests: build a model in which the package "/Owner" declares the
+    // reference base "Base" pointing at "/Target", and the sub-package "/Owner/Sub" contains a
+    // relative reference which uses that base to refer to "/Target/Ecu".
+    //
+    // returns (model, /Owner, /Target, the relative reference element)
+    fn build_relative_reference_model() -> (AutosarModel, Element, Element, Element) {
+        let model = AutosarModel::new();
+        model.create_file("test", AutosarVersion::LATEST).unwrap();
+        let el_ar_packages = model
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .unwrap();
+        let (el_target, el_ecu) = create_target_package(&el_ar_packages, "Target");
+        let el_owner = el_ar_packages
+            .create_named_sub_element(ElementName::ArPackage, "Owner")
+            .unwrap();
+        create_reference_base(&el_owner, "Base", &el_target);
+        let el_owner_packages = el_owner.create_sub_element(ElementName::ArPackages).unwrap();
+        let el_ref = create_relative_reference(&el_owner_packages, "Sub", &el_ecu, "Base");
+
+        // the reference is written as a relative path, and resolves through the reference base
+        assert_eq!(el_ref.character_data().unwrap().string_value().unwrap(), "Ecu");
+        assert_eq!(el_ref.get_reference_target().unwrap(), el_ecu);
+        assert!(model.check_references().is_empty());
+
+        (model, el_owner, el_target, el_ref)
+    }
+
+    #[test]
+    fn rename_reference_base_owner_package() {
+        // renaming the package which declares a reference base changes the scope in which the
+        // reference base is visible, so the cached owner package path must be updated
+        let (model, el_owner, _el_target, el_ref) = build_relative_reference_model();
+        el_owner.set_item_name("Renamed").unwrap();
+
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Target"));
+        // the reference has moved to /Renamed/Sub together with the reference base, so it still resolves
+        assert_eq!(el_ref.get_reference_target().unwrap().path().unwrap(), "/Target/Ecu");
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn rename_reference_base_target_package() {
+        // renaming the package a reference base points at updates the PACKAGE-REF like any other
+        // reference; the cached copy of the PACKAGE-REF must be updated to match
+        let (model, el_owner, el_target, el_ref) = build_relative_reference_model();
+        el_target.set_item_name("Renamed").unwrap();
+
+        let el_package_ref = get_package_ref(&el_owner);
+        assert_eq!(
+            el_package_ref.character_data().unwrap().string_value().unwrap(),
+            "/Renamed"
+        );
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Renamed"));
+        // the relative reference is unchanged, but now resolves to the renamed target
+        assert_eq!(el_ref.character_data().unwrap().string_value().unwrap(), "Ecu");
+        assert_eq!(el_ref.get_reference_target().unwrap().path().unwrap(), "/Renamed/Ecu");
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn rename_reference_base_path_boundary() {
+        // renaming /Pkg1 must not affect anything belonging to /Pkg10
+        let model = AutosarModel::new();
+        model.create_file("test", AutosarVersion::LATEST).unwrap();
+        let el_ar_packages = model
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .unwrap();
+        let (el_pkg1, _) = create_target_package(&el_ar_packages, "Pkg1");
+        let (el_pkg10, _) = create_target_package(&el_ar_packages, "Pkg10");
+        // both packages declare a reference base, each pointing at the other one
+        create_reference_base(&el_pkg1, "Base1", &el_pkg10);
+        create_reference_base(&el_pkg10, "Base10", &el_pkg1);
+
+        el_pkg1.set_item_name("Renamed").unwrap();
+
+        // each base is still declared by its own package and points at the other one; the PACKAGE-REF
+        // of Base10 followed the rename of /Pkg1, and the one in /Pkg10 was not touched by it
+        assert_eq!(
+            get_package_ref(&el_pkg1).resolve_reference_base("Base1").as_deref(),
+            Some("/Pkg10")
+        );
+        assert_eq!(get_package_ref(&el_pkg1).resolve_reference_base("Base10"), None);
+        assert_eq!(
+            get_package_ref(&el_pkg10).resolve_reference_base("Base10").as_deref(),
+            Some("/Renamed")
+        );
+        assert_eq!(get_package_ref(&el_pkg10).resolve_reference_base("Base1"), None);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn rename_short_name_of_reference_base_owner() {
+        // Element::set_character_data on a SHORT-NAME renames an element without updating any
+        // references to it. A reference base is found through the position of the REFERENCE-BASE in the
+        // element tree, so renaming the package which declares it this way keeps it in scope.
+        let (model, el_owner, el_target, el_ref) = build_relative_reference_model();
+        el_owner
+            .get_sub_element(ElementName::ShortName)
+            .and_then(|e| e.set_character_data("Renamed").ok())
+            .unwrap();
+
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Target"));
+        assert_eq!(el_ref.get_reference_target().unwrap().path().unwrap(), "/Target/Ecu");
+
+        // The PACKAGE-REF of the reference base *is* a reference, so renaming its target this way
+        // deliberately leaves it pointing at the old path. The cache must agree with the document,
+        // which means the reference base - and the relative reference using it - now dangle.
+        el_target
+            .get_sub_element(ElementName::ShortName)
+            .and_then(|e| e.set_character_data("MovedAway").ok())
+            .unwrap();
+
+        // the PACKAGE-REF still contains "/Target", which no longer exists
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Target"));
+        assert!(el_ref.get_reference_target().is_err());
+        // both the PACKAGE-REF, which still points at "/Target", and the relative reference which
+        // resolves through it are now broken
+        assert_eq!(model.check_references().len(), 2);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_reference_base_owner_package() {
+        // moving the package which declares a reference base must update the cached owner package path
+        let (model, el_owner, el_target, el_ref) = build_relative_reference_model();
+        el_target
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.move_element_here(&el_owner))
+            .unwrap();
+
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Target"));
+        // the relative reference moved along with the reference base, so it still resolves
+        assert!(model.get_element_by_path("/Target/Owner/Sub/System").is_some());
+        assert_eq!(el_ref.get_reference_target().unwrap().path().unwrap(), "/Target/Ecu");
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_reference_base_target_package() {
+        // moving the package a reference base points at updates the PACKAGE-REF like any other
+        // reference; the cached copy of the PACKAGE-REF must be updated to match
+        let (model, el_owner, el_target, el_ref) = build_relative_reference_model();
+        el_owner
+            .get_sub_element(ElementName::ArPackages)
+            .unwrap()
+            .move_element_here(&el_target)
+            .unwrap();
+
+        assert_eq!(
+            get_package_ref(&el_owner)
+                .character_data()
+                .unwrap()
+                .string_value()
+                .unwrap(),
+            "/Owner/Target"
+        );
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Owner/Target"));
+        assert_eq!(
+            el_ref.get_reference_target().unwrap().path().unwrap(),
+            "/Owner/Target/Ecu"
+        );
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_reference_bases_element_to_other_package() {
+        // Moving a REFERENCE-BASES element to a different package changes the owner of every
+        // reference base inside it. REFERENCE-BASES is not identifiable, so this cannot be handled
+        // by remapping paths - the owning package does not move at all.
+        let (model, el_owner, el_target, el_ref) = build_relative_reference_model();
+        let el_reference_bases = el_owner.get_sub_element(ElementName::ReferenceBases).unwrap();
+        el_target.move_element_here(&el_reference_bases).unwrap();
+
+        // the reference base is no longer in scope for the reference in /Owner/Sub
+        assert_eq!(resolved_reference_base(&el_ref), None);
+        assert!(el_ref.get_reference_target().is_err());
+        assert_eq!(model.check_references().len(), 1);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_single_reference_base_to_other_package() {
+        // the same applies when a single REFERENCE-BASE is moved out of the REFERENCE-BASES element
+        // of one package into that of another package
+        let (model, el_owner, el_target, el_ref) = build_relative_reference_model();
+        let el_reference_base = el_owner
+            .get_sub_element(ElementName::ReferenceBases)
+            .and_then(|e| e.get_sub_element(ElementName::ReferenceBase))
+            .unwrap();
+        el_target
+            .create_sub_element(ElementName::ReferenceBases)
+            .and_then(|e| e.move_element_here(&el_reference_base))
+            .unwrap();
+
+        assert_eq!(resolved_reference_base(&el_ref), None);
+        assert!(el_ref.get_reference_target().is_err());
+
+        // a relative reference inside /Target can use the reference base at its new location
+        let el_target_packages = el_target.create_sub_element(ElementName::ArPackages).unwrap();
+        let el_ecu = model.get_element_by_path("/Target/Ecu").unwrap();
+        let el_new_ref = create_relative_reference(&el_target_packages, "Consumer", &el_ecu, "Base");
+        assert_eq!(el_new_ref.get_reference_target().unwrap(), el_ecu);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_unnamed_element_containing_packages() {
+        // Moving a non-identifiable element which contains identifiable elements: one path remapping
+        // entry is created per identifiable element directly inside the moved element. Everything
+        // below such an element - further identifiable elements as well as reference bases - is
+        // covered by that entry, so the collection loop does not need to descend into it.
+        let model = AutosarModel::new();
+        model.create_file("test", AutosarVersion::LATEST).unwrap();
+        let el_ar_packages = model
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .unwrap();
+        let (el_target, el_ecu) = create_target_package(&el_ar_packages, "Target");
+        let el_dest = el_ar_packages
+            .create_named_sub_element(ElementName::ArPackage, "Dest")
+            .unwrap();
+        let el_holder_packages = el_ar_packages
+            .create_named_sub_element(ElementName::ArPackage, "Holder")
+            .and_then(|e| e.create_sub_element(ElementName::ArPackages))
+            .unwrap();
+
+        // PkgA declares a reference base and contains a sub-package which uses it
+        let el_pkg_a = el_holder_packages
+            .create_named_sub_element(ElementName::ArPackage, "PkgA")
+            .unwrap();
+        create_reference_base(&el_pkg_a, "BaseA", &el_target);
+        let el_pkg_a_packages = el_pkg_a.create_sub_element(ElementName::ArPackages).unwrap();
+        let el_ref = create_relative_reference(&el_pkg_a_packages, "PkgA_Sub", &el_ecu, "BaseA");
+        // PkgB is a sibling of PkgA, and follows it in the element order
+        let el_pkg_b = el_holder_packages
+            .create_named_sub_element(ElementName::ArPackage, "PkgB")
+            .unwrap();
+        create_reference_base(&el_pkg_b, "BaseB", &el_target);
+
+        assert_eq!(el_ref.get_reference_target().unwrap(), el_ecu);
+        assert!(model.get_element_by_path("/Holder/PkgA/PkgA_Sub").is_some());
+
+        // move the AR-PACKAGES element, which is not identifiable, into /Dest
+        el_dest.move_element_here(&el_holder_packages).unwrap();
+
+        // the identifiable elements directly inside the moved element are remapped ...
+        assert!(model.get_element_by_path("/Dest/PkgA").is_some());
+        assert!(model.get_element_by_path("/Dest/PkgB").is_some());
+        // ... and so are the identifiable elements nested below them, which the collection loop
+        // never visits because it skips the subtree of PkgA
+        assert!(model.get_element_by_path("/Dest/PkgA/PkgA_Sub").is_some());
+        assert!(model.get_element_by_path("/Holder/PkgA").is_none());
+        assert!(model.get_element_by_path("/Holder/PkgA/PkgA_Sub").is_none());
+        assert!(model.get_element_by_path("/Holder/PkgB").is_none());
+
+        // the reference base inside the skipped subtree of PkgA still applies to the reference which
+        // uses it, and BaseB proves that the sibling following PkgA is not skipped along with it
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Target"));
+        assert_eq!(
+            get_package_ref(&el_pkg_b).resolve_reference_base("BaseB").as_deref(),
+            Some("/Target")
+        );
+
+        // the relative reference in the nested sub-package still resolves through BaseA
+        assert_eq!(el_ref.get_reference_target().unwrap(), el_ecu);
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_relative_reference_out_of_scope() {
+        // A subtree containing relative references can be moved to a location where the reference
+        // base is no longer in scope. The reference text is not rewritten, so the reference dangles.
+        let (model, _el_owner, el_target, el_ref) = build_relative_reference_model();
+        let el_sub = model.get_element_by_path("/Owner/Sub").unwrap();
+        el_target
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.move_element_here(&el_sub))
+            .unwrap();
+
+        assert_eq!(el_ref.character_data().unwrap().string_value().unwrap(), "Ecu");
+        assert!(el_ref.get_reference_target().is_err());
+        let broken = model.check_references();
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].upgrade().unwrap(), el_ref);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_relative_reference_into_new_scope() {
+        // ... and if a reference base with the same label is in scope at the new location, then the
+        // relative reference resolves through that one instead
+        let (model, _el_owner, _el_target, el_ref) = build_relative_reference_model();
+        let el_ar_packages = model.root_element().get_sub_element(ElementName::ArPackages).unwrap();
+        // /Other declares the same base label, but points at a different package
+        let (el_other_target, _) = create_target_package(&el_ar_packages, "OtherTarget");
+        let el_other = el_ar_packages
+            .create_named_sub_element(ElementName::ArPackage, "Other")
+            .unwrap();
+        create_reference_base(&el_other, "Base", &el_other_target);
+
+        let el_sub = model.get_element_by_path("/Owner/Sub").unwrap();
+        el_other
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.move_element_here(&el_sub))
+            .unwrap();
+
+        assert_eq!(el_ref.character_data().unwrap().string_value().unwrap(), "Ecu");
+        assert_eq!(
+            el_ref.get_reference_target().unwrap().path().unwrap(),
+            "/OtherTarget/Ecu"
+        );
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn move_element_full_migrates_reference_bases() {
+        // a cross-model move takes the reference bases along with the moved elements, so a relative
+        // reference among them still resolves in the destination model
+        let (model_src, el_owner, _el_target, el_ref) = build_relative_reference_model();
+
+        let model_dest = AutosarModel::new();
+        model_dest.create_file("dest", AutosarVersion::LATEST).unwrap();
+        let el_dest_packages = model_dest
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .unwrap();
+        // the destination model gets its own copy of the target package, so that the reference base
+        // still points at something after the move
+        create_target_package(&el_dest_packages, "Target");
+        let el_dest_outer = el_dest_packages
+            .create_named_sub_element(ElementName::ArPackage, "Outer")
+            .and_then(|e| e.create_sub_element(ElementName::ArPackages))
+            .unwrap();
+
+        el_dest_outer.move_element_here(&el_owner).unwrap();
+
+        assert!(model_src.0.read().relative_references.is_empty());
+        // the moved reference resolves through the moved reference base, in the destination model
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Target"));
+        // the relative reference is registered in the destination model and resolves there
+        assert!(!model_dest.0.read().relative_references.is_empty());
+        assert_eq!(el_ref.get_reference_target().unwrap().path().unwrap(), "/Target/Ecu");
+        assert_eq!(model_dest.get_references_to("/Target/Ecu").len(), 1);
+        assert!(model_dest.check_references().is_empty());
+    }
+
+    #[test]
+    fn move_element_full_keeps_external_references() {
+        // a reference which points outside of the moved subtree keeps its text, but it must still be
+        // registered in the destination model
+        let model_src = AutosarModel::new();
+        model_src.create_file("src", AutosarVersion::LATEST).unwrap();
+        let el_src_packages = model_src
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .unwrap();
+        let (_, el_src_ecu) = create_target_package(&el_src_packages, "Target");
+        let el_ref = el_src_packages
+            .create_named_sub_element(ElementName::ArPackage, "Sub")
+            .and_then(|e| e.create_sub_element(ElementName::Elements))
+            .and_then(|e| e.create_named_sub_element(ElementName::System, "System"))
+            .and_then(|e| e.create_sub_element(ElementName::FibexElements))
+            .and_then(|e| e.create_sub_element(ElementName::FibexElementRefConditional))
+            .and_then(|e| e.create_sub_element(ElementName::FibexElementRef))
+            .unwrap();
+        el_ref.set_reference_target(&el_src_ecu).unwrap();
+
+        let model_dest = AutosarModel::new();
+        model_dest.create_file("dest", AutosarVersion::LATEST).unwrap();
+        let el_dest_packages = model_dest
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .unwrap();
+        create_target_package(&el_dest_packages, "Target");
+
+        let el_sub = model_src.get_element_by_path("/Sub").unwrap();
+        el_dest_packages.move_element_here(&el_sub).unwrap();
+
+        // the reference points outside the moved subtree, so its text is unchanged
+        assert_eq!(el_ref.character_data().unwrap().string_value().unwrap(), "/Target/Ecu");
+        // it must be findable in the destination model, where it resolves to the destination's own
+        // element at that path
+        assert_eq!(model_dest.get_references_to("/Target/Ecu").len(), 1);
+        assert_eq!(model_src.get_references_to("/Target/Ecu").len(), 0);
+        assert!(model_dest.check_references().is_empty());
+    }
+
+    #[test]
+    fn copy_resolves_relative_references() {
+        // the copy of an element which contains both a REFERENCE-BASE and a relative reference using it
+        // must resolve within the copy
+        let (model, el_owner, _el_target, _el_ref) = build_relative_reference_model();
+        let el_ar_packages = model.root_element().get_sub_element(ElementName::ArPackages).unwrap();
+        let el_copy = el_ar_packages.create_copied_sub_element(&el_owner).unwrap();
+
+        assert_eq!(el_copy.path().unwrap(), "/Owner_1");
+
+        // the copied relative reference resolves through the copied reference base
+        let el_copied_ref = model
+            .get_element_by_path("/Owner_1/Sub/System")
+            .and_then(|e| e.get_sub_element(ElementName::FibexElements))
+            .and_then(|e| e.get_sub_element_at(0))
+            .and_then(|e| e.get_sub_element(ElementName::FibexElementRef))
+            .unwrap();
+        assert_eq!(
+            el_copied_ref.get_reference_target().unwrap().path().unwrap(),
+            "/Target/Ecu"
+        );
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn set_character_data_on_package_ref_retargets_reference_base() {
+        // PACKAGE-REF is a reference element, so writing its content takes the reference branch of
+        // set_character_data. The reference base declared by it must be updated anyway.
+        let (model, el_owner, _el_target, el_ref) = build_relative_reference_model();
+        let el_ar_packages = model.root_element().get_sub_element(ElementName::ArPackages).unwrap();
+        create_target_package(&el_ar_packages, "OtherTarget");
+
+        assert_eq!(model.get_references_to("/Target/Ecu").len(), 1);
+
+        get_package_ref(&el_owner).set_character_data("/OtherTarget").unwrap();
+
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/OtherTarget"));
+        assert_eq!(
+            el_ref.get_reference_target().unwrap().path().unwrap(),
+            "/OtherTarget/Ecu"
+        );
+        // retargeting the reference base changes what the relative reference points at without
+        // changing its character data, so the reference has to be re-registered under the new path
+        assert_eq!(model.get_references_to("/OtherTarget/Ecu").len(), 1);
+        assert!(model.get_references_to("/Target/Ecu").is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn set_base_attribute_on_package_ref_chains_reference_base() {
+        // the BASE attribute of a PACKAGE-REF selects the reference base which the PACKAGE-REF
+        // itself is relative to, so it is part of the cached declaration
+        let (model, el_owner, el_target, _el_ref) = build_relative_reference_model();
+        // add a second reference base in /Owner, whose PACKAGE-REF is relative to "Base"
+        let el_inner = el_target
+            .get_sub_element(ElementName::ArPackages)
+            .unwrap_or_else(|| el_target.create_sub_element(ElementName::ArPackages).unwrap())
+            .create_named_sub_element(ElementName::ArPackage, "Inner")
+            .unwrap();
+        create_reference_base(&el_owner, "Chained", &el_inner);
+        let el_owner_package_ref = get_package_ref(&el_owner);
+        assert_eq!(
+            el_owner_package_ref.resolve_reference_base("Chained").as_deref(),
+            Some("/Target/Inner")
+        );
+
+        // rewrite the chained base to be relative to "Base"
+        let el_chained_package_ref = el_owner
+            .get_sub_element(ElementName::ReferenceBases)
+            .and_then(|e| e.get_sub_element_at(1))
+            .and_then(|e| e.get_sub_element(ElementName::PackageRef))
+            .unwrap();
+        el_chained_package_ref.set_character_data("Inner").unwrap();
+        el_chained_package_ref
+            .set_attribute_string(AttributeName::Base, "Base")
+            .unwrap();
+
+        // the chained form leads to the same package as the absolute form did
+        assert_eq!(
+            el_owner_package_ref.resolve_reference_base("Chained").as_deref(),
+            Some("/Target/Inner")
+        );
+
+        // removing the BASE attribute leaves the relative text in place, so the declaration now names
+        // the bogus path "Inner"
+        assert!(el_chained_package_ref.remove_attribute(AttributeName::Base));
+        assert_eq!(
+            el_owner_package_ref.resolve_reference_base("Chained").as_deref(),
+            Some("Inner")
+        );
+        assert_eq!(model.verify_reference_caches(), Ok(()));
     }
 }

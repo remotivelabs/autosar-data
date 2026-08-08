@@ -13,7 +13,19 @@ use std::sync::Arc;
 use crate::{
     Attribute, AutosarDataError, AutosarModel, CharacterData, ContentType, Element, ElementContent, ElementOrModel,
     ElementRaw, WeakArxmlFile, WeakElement,
+    autosarmodel::{PathRemap, replace_path_prefix},
 };
+
+/// build an Autosar path from the stack of item names collected while descending the element tree
+///
+/// Elements which are not identifiable contribute a `None` entry, which is skipped here.
+fn join_path_parts(path_parts: &[Option<String>]) -> String {
+    path_parts
+        .iter()
+        .filter_map(std::clone::Clone::clone)
+        .collect::<Vec<String>>()
+        .join("/")
+}
 
 /// `ElementRaw` provides the internal implementation of (almost) all Element operations
 ///
@@ -101,33 +113,11 @@ impl ElementRaw {
                 let mut subelem = subelem_wrapped.0.write();
                 if subelem.element_name() == ElementName::ShortName {
                     subelem.set_character_data(new_name.to_owned(), version)?;
-                    model.fix_identifiables(&old_path, &new_path);
-                    let new_prefix = new_path;
-                    let mut model_locked = model.0.write();
-
-                    // check all references and update those that point to this element or its sub elements
-                    let refpaths = model_locked.reference_origins.keys().cloned().collect::<Vec<String>>();
-                    for refpath in refpaths {
-                        // if the existing reference has the old path as a prefix, then it needs to be updated
-                        if let Some(partial_path) = refpath.strip_prefix(&old_path) {
-                            // prevent ref updates from being applied to e.g. /package10 while renaming /package1
-                            if (partial_path.is_empty() || partial_path.starts_with('/'))
-                                && let Some(reflist) = model_locked.reference_origins.remove(&refpath)
-                            {
-                                let refpath_new = format!("{new_prefix}{partial_path}");
-
-                                for weak_ref_elem in &reflist {
-                                    if let Some(ref_elem) = weak_ref_elem.upgrade() {
-                                        let mut ref_elem_locked = ref_elem.0.write();
-                                        // can't use .set_character_data() here, because the model is locked
-                                        ref_elem_locked.content[0] =
-                                            ElementContent::CharacterData(CharacterData::String(refpath_new.clone()));
-                                    }
-                                }
-                                model_locked.reference_origins.insert(refpath_new, reflist);
-                            }
-                        }
-                    }
+                    // the renamed element might contain other identifiable elements, reference bases
+                    // and references, all of which are affected by the new path
+                    let remap = PathRemap::single(old_path, new_path);
+                    model.fix_element_paths(&remap);
+                    model.fix_reference_paths(&remap, version)?;
                 }
             }
 
@@ -511,12 +501,7 @@ impl ElementRaw {
             // add each identifiable sub element to the identifiables hashmap
             if sub_elem.is_identifiable() {
                 path_parts.push(sub_elem.item_name());
-                let sub_elem_path = path_parts
-                    .iter()
-                    .filter_map(std::clone::Clone::clone)
-                    .collect::<Vec<String>>()
-                    .join("/");
-                model.add_identifiable(sub_elem_path, sub_elem.downgrade());
+                model.add_identifiable(join_path_parts(&path_parts), sub_elem.downgrade());
             } else {
                 path_parts.push(None);
             }
@@ -776,17 +761,24 @@ impl ElementRaw {
             element: move_element.element_name(),
         })?;
 
-        // collect the paths of all identifiable elements under new_element before moving it
-        let original_paths: Vec<String> = move_element
-            .elements_dfs()
-            .filter_map(|(_, e)| {
-                if e.element_type().is_named() {
-                    e.path().ok()
-                } else {
-                    None
+        // Collect the paths of the identifiable elements under move_element before moving it.
+        // Only the topmost identifiable elements are needed, since each of them is the root of a
+        // subtree in which every path changes in the same way.
+        let mut original_paths: Vec<String> = Vec::new();
+        if !move_element.is_identifiable() {
+            let mut dfs_iter = move_element.elements_dfs();
+            let mut next = dfs_iter.next();
+            while let Some((_, elem)) = next {
+                if elem.element_type().is_named()
+                    && let Ok(path) = elem.path()
+                {
+                    original_paths.push(path);
+                    next = dfs_iter.next_sibling(); // move sideways, skipping the subtree
+                    continue;
                 }
-            })
-            .collect();
+                next = dfs_iter.next();
+            }
+        }
 
         let src_path_prefix = move_element.0.read().path_unchecked()?;
         let dest_path_prefix = self.path_unchecked()?;
@@ -823,37 +815,29 @@ impl ElementRaw {
         };
         drop(move_element_locked);
 
-        // fix the identifiables cache
-        if move_element.is_identifiable() {
-            // simple case: the moved element is identifiable; fix_identifiables automatically handles the sub-elements
-            model.fix_identifiables(&src_path_prefix, &dest_path);
+        // describe how the paths inside the moved subtree have changed
+        let remap = if move_element.is_identifiable() {
+            // simple case: the moved element is identifiable, so its path is the prefix of every path inside it
+            PathRemap::single(src_path_prefix.clone(), dest_path.clone())
         } else {
-            // the moved element is not identifiable, so its identifiable sub-elements must be fixed individually
-            for orig_path in &original_paths {
-                if let Some(suffix) = orig_path.strip_prefix(&src_path_prefix) {
-                    let updated_path = format!("{dest_path}{suffix}");
-                    model.fix_identifiables(orig_path, &updated_path);
-                }
-            }
-        }
+            // the moved element has no path of its own, so one entry per identifiable element
+            // directly inside it is needed. e.g. orig_path = "/Pkg/Foo/Elem" and
+            // src_path_prefix = "/Pkg/Foo", then the new path is "{dest_path}/Elem"
+            PathRemap::new(
+                original_paths
+                    .iter()
+                    .filter_map(|orig_path| {
+                        replace_path_prefix(orig_path, &src_path_prefix, &dest_path)
+                            .map(|new_path| (orig_path.clone(), new_path))
+                    })
+                    .collect(),
+            )
+        };
 
-        // the move_element was moved within this autosar model, so we can update all other references pointing to it
-        let mut model_locked = model.0.write();
-        for orig_ref in &original_paths {
-            if let Some(suffix) = orig_ref.strip_prefix(&src_path_prefix) {
-                // e.g. orig_ref = "/Pkg/Foo/Sub/Element" and src_path_prefix = "/Pkg/Foo" then suffix = "/Sub/Element"
-                // strip prefix can't fail, because all original_paths have the src_path_prefix
-                if let Some(ref_elements) = model_locked.reference_origins.remove(orig_ref) {
-                    let refstr = format!("{dest_path}{suffix}");
-                    for ref_element_weak in &ref_elements {
-                        if let Some(ref_element) = ref_element_weak.upgrade() {
-                            ref_element.0.write().set_character_data(refstr.clone(), version)?;
-                        }
-                    }
-                    model_locked.reference_origins.insert(refstr, ref_elements);
-                }
-            }
-        }
+        // fix the caches which record where the moved elements are, then update all references
+        // pointing into the moved subtree, since the move happened within a single model
+        model.fix_element_paths(&remap);
+        model.fix_reference_paths(&remap, version)?;
 
         // insert move_element
         self.content
@@ -926,10 +910,7 @@ impl ElementRaw {
         }
         // delete all reference origin info for elements under move_element
         for (path, elem) in &original_refs {
-            let base = elem
-                .attribute_value(AttributeName::Base)
-                .and_then(|cdata| cdata.string_value());
-            model_src.remove_reference_origin(path, base.as_deref(), elem.downgrade());
+            model_src.remove_reference_origin(path, elem.downgrade());
         }
 
         // set the parent of the new element to the current element
@@ -945,25 +926,29 @@ impl ElementRaw {
 
         // cache references to all the identifiable elements in move_element
         for (orig_path, identifiable_element) in &original_paths {
-            if let Some(suffix) = orig_path.strip_prefix(&src_path_prefix) {
-                let path = format!("{dest_path}{suffix}");
+            if let Some(path) = replace_path_prefix(orig_path, &src_path_prefix, &dest_path) {
                 model.add_identifiable(path, identifiable_element.downgrade());
             }
         }
-        // cache all newly added reference origins under move_element
+        // cache all reference origins under move_element in the destination model
         for (old_ref, ref_element) in original_refs {
-            // if the reference points to a known old path, then update it to use the new path instead
-            if original_paths.contains_key(&old_ref) {
-                let mut refstr = old_ref.clone();
-                if let Some(suffix) = old_ref.strip_prefix(&src_path_prefix) {
-                    refstr = format!("{dest_path}{suffix}");
-                    ref_element.0.write().set_character_data(refstr.clone(), version)?;
-                }
-                let base = ref_element
-                    .attribute_value(AttributeName::Base)
-                    .and_then(|cdata| cdata.string_value());
-                model.add_reference_origin(&refstr, base.as_deref(), ref_element.downgrade());
-            }
+            let base = ref_element
+                .attribute_value(AttributeName::Base)
+                .and_then(|cdata| cdata.string_value());
+            // An absolute reference to an element inside the moved subtree follows its target, so it
+            // is updated to the new path. Every other reference keeps its text: an absolute
+            // reference to an element outside the moved subtree still points at the same path, and
+            // relative references are never rewritten - they are simply resolved in the new location.
+            let refstr = if base.is_none()
+                && original_paths.contains_key(&old_ref)
+                && let Some(new_ref) = replace_path_prefix(&old_ref, &src_path_prefix, &dest_path)
+            {
+                ref_element.0.write().set_character_data(new_ref.clone(), version)?;
+                new_ref
+            } else {
+                old_ref
+            };
+            model.add_reference_origin(&refstr, base.as_deref(), ref_element.downgrade());
         }
 
         // insert move_element
@@ -1128,14 +1113,10 @@ impl ElementRaw {
         if self.elemtype.is_named() && sub_element_locked.elemname == ElementName::ShortName {
             // may not remove the SHORT-NAME, because that would leave the data in an invalid state
             return Err(AutosarDataError::ShortNameRemovalForbidden);
-        } else if self.elemname == ElementName::ReferenceBases
-            && sub_element_locked.elemname == ElementName::ReferenceBase
-        {
-            // removing a whole reference base
-            self.remove_reference_base(model, &sub_element_locked);
         } else if self.elemname == ElementName::ReferenceBase {
-            // removing data from a reference base, making it invalid
-            self.remove_incomplete_reference_base(model, &sub_element_locked);
+            // removing data from a reference base, making it invalid.
+            // Removal of a whole REFERENCE-BASE is not handled here, but in remove_internal(), which
+            // also covers the case that any element above the REFERENCE-BASE is removed.
         }
         sub_element_locked.remove_internal(sub_element.downgrade(), model, path);
         self.content.remove(pos);
@@ -1159,10 +1140,7 @@ impl ElementRaw {
             && let Some(CharacterData::String(reference)) = self.character_data()
         {
             // remove the references-reference (ugh. terminology???)
-            let base = self
-                .attribute_value(AttributeName::Base)
-                .and_then(|cdata| cdata.string_value());
-            model.remove_reference_origin(&reference, base.as_deref(), self_weak);
+            model.remove_reference_origin(&reference, self_weak);
         }
         for item in &self.content {
             if let ElementContent::Element(sub_element) = item {
@@ -1472,60 +1450,37 @@ impl ElementRaw {
         }
     }
 
-    fn remove_reference_base(&mut self, model: &AutosarModel, sub_element_locked: &ElementRaw) -> Option<()> {
-        // here self is a REFERENCE-BASES element and sub_element_locked is the REFERENCE-BASE element that is being removed from it.
-        let base_label = sub_element_locked.content.iter().find_map(|item| {
-            if let ElementContent::Element(elem) = item
-                && elem.element_name() == ElementName::ShortLabel
-            {
-                elem.character_data()?.string_value()
-            } else {
-                None
+    /// get the declaration data of a REFERENCE-BASE element
+    ///
+    /// self must be a REFERENCE-BASE element. The result is
+    /// `(short label, package ref, package ref base)`, where the package ref base is the BASE
+    /// attribute of the PACKAGE-REF, i.e. the reference base that the PACKAGE-REF itself is
+    /// relative to. The result is None if either the SHORT-LABEL or the PACKAGE-REF is missing,
+    /// because then the reference base cannot be used to resolve anything.
+    ///
+    /// The sub element locks are acquired with a timeout, and the result is None if that fails: this is
+    /// called while the model lock is held, and other operations acquire the model lock while holding an
+    /// element lock, so a blocking lock here could deadlock.
+    pub(crate) fn reference_base_declaration(&self) -> Option<(String, String, Option<String>)> {
+        let mut short_label = None;
+        let mut package_ref = None;
+        let mut package_ref_base = None;
+
+        for item in &self.content {
+            if let ElementContent::Element(sub_elem) = item {
+                let locked_sub_elem = sub_elem.0.try_read_for(Duration::from_millis(10))?;
+                if locked_sub_elem.elemname == ElementName::ShortLabel {
+                    short_label = locked_sub_elem.character_data().and_then(|cdata| cdata.string_value());
+                } else if locked_sub_elem.elemname == ElementName::PackageRef {
+                    package_ref = locked_sub_elem.character_data().and_then(|cdata| cdata.string_value());
+                    package_ref_base = locked_sub_elem
+                        .attribute_value(AttributeName::Base)
+                        .and_then(|cdata| cdata.string_value());
+                }
             }
-        })?;
-        // the parent of REFERENCE-BASES is an AR-PACKAGE, so the owner package path can be obtained from it
-        let owner_package_path = if let ElementOrModel::Element(weak_parent) = &self.parent {
-            weak_parent.upgrade()?.path().ok()?
-        } else {
-            return None;
-        };
-        model.remove_reference_base(&base_label, &owner_package_path);
+        }
 
-        Some(())
-    }
-
-    fn remove_incomplete_reference_base(
-        &mut self,
-        model: &AutosarModel,
-        sub_element_locked: &parking_lot::lock_api::RwLockWriteGuard<'_, parking_lot::RawRwLock, ElementRaw>,
-    ) -> Option<()> {
-        // self is a a REFERENCE-BASE element
-        let base_label = if sub_element_locked.elemname == ElementName::ShortLabel {
-            sub_element_locked.character_data()?.string_value()?
-        } else if sub_element_locked.elemname == ElementName::PackageRef {
-            self.content
-                .iter()
-                .find_map(|item| {
-                    if let ElementContent::Element(elem) = item
-                        && elem.element_name() == ElementName::ShortLabel
-                    {
-                        Some(elem)
-                    } else {
-                        None
-                    }
-                })?
-                .character_data()?
-                .string_value()?
-        } else {
-            return None;
-        };
-        let ElementOrModel::Element(weak_parent) = &self.parent else {
-            return None;
-        };
-        let owner_package_path = weak_parent.upgrade()?.package().ok()??.path().ok()?;
-        model.remove_reference_base(&base_label, &owner_package_path);
-
-        Some(())
+        Some((short_label?, package_ref?, package_ref_base))
     }
 
     pub(crate) fn wrap(self) -> Element {
