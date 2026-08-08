@@ -348,9 +348,9 @@ fn display_flexray_cluster(cluster_element: &Element) -> Option<()> {
         && let Some(proto_ver) = fcc
             .get_sub_element(ElementName::ProtocolVersion)
             .and_then(|elem| elem.character_data())
-        {
-            println!("  Protocol: {proto_name} {proto_ver}");
-        }
+    {
+        println!("  Protocol: {proto_name} {proto_ver}");
+    }
     if let Some(baudrate) = fcc
         .get_sub_element(ElementName::Baudrate)
         .and_then(|elem| elem.character_data())
@@ -768,33 +768,33 @@ fn display_isignal_ipdu(pdu: &Element, indent: usize) {
             && let Some(TimeRange { tolerance, value }) = cyclic_timing
                 .get_sub_element(ElementName::TimePeriod)
                 .and_then(|elem| get_time_range(&elem))
+        {
+            println!("{indentation}Cyclic timing: {value} s");
+            match tolerance {
+                Some(TimeRangeTolerance::Absolute(absval)) => {
+                    println!("{indentation}Cyclic timing tolerance: {absval} s")
+                }
+                Some(TimeRangeTolerance::Relative(relval)) => {
+                    println!("{indentation}Cyclic timing tolerance: {relval} %")
+                }
+                _ => {}
+            }
+            if let Some(TimeRange { tolerance, value }) = cyclic_timing
+                .get_sub_element(ElementName::TimeOffset)
+                .and_then(|elem| get_time_range(&elem))
             {
-                println!("{indentation}Cyclic timing: {value} s");
+                println!("{indentation}Cyclic timing offset: {value} s");
                 match tolerance {
                     Some(TimeRangeTolerance::Absolute(absval)) => {
-                        println!("{indentation}Cyclic timing tolerance: {absval} s")
+                        println!("{indentation}Cyclic timing offset tolerance: {absval} s")
                     }
                     Some(TimeRangeTolerance::Relative(relval)) => {
-                        println!("{indentation}Cyclic timing tolerance: {relval} %")
+                        println!("{indentation}Cyclic timing offset tolerance: {relval} %")
                     }
                     _ => {}
                 }
-                if let Some(TimeRange { tolerance, value }) = cyclic_timing
-                    .get_sub_element(ElementName::TimeOffset)
-                    .and_then(|elem| get_time_range(&elem))
-                {
-                    println!("{indentation}Cyclic timing offset: {value} s");
-                    match tolerance {
-                        Some(TimeRangeTolerance::Absolute(absval)) => {
-                            println!("{indentation}Cyclic timing offset tolerance: {absval} s")
-                        }
-                        Some(TimeRangeTolerance::Relative(relval)) => {
-                            println!("{indentation}Cyclic timing offset tolerance: {relval} %")
-                        }
-                        _ => {}
-                    }
-                }
             }
+        }
         if let Some(event_timing) = tx_mode_true_timing.get_sub_element(ElementName::EventControlledTiming) {
             println!("{indentation}Event controlled timing:");
             if let Some(num_reps) = event_timing
@@ -805,19 +805,20 @@ fn display_isignal_ipdu(pdu: &Element, indent: usize) {
                 println!("{indentation}  Number of repetitions: {num_reps}");
             }
             if let Some(repetition_period) = event_timing.get_sub_element(ElementName::RepetitionPeriod)
-                && let Some(TimeRange { tolerance, value }) = get_time_range(&repetition_period) {
-                    println!("          Repetition period: {value}");
-                    if let Some(tol) = tolerance {
-                        match tol {
-                            TimeRangeTolerance::Relative(percent) => {
-                                println!("{indentation}  Repetition period tolerance: {percent}%")
-                            }
-                            TimeRangeTolerance::Absolute(abstol) => {
-                                println!("{indentation}  Repetition period tolerance: {abstol} s")
-                            }
+                && let Some(TimeRange { tolerance, value }) = get_time_range(&repetition_period)
+            {
+                println!("          Repetition period: {value}");
+                if let Some(tol) = tolerance {
+                    match tol {
+                        TimeRangeTolerance::Relative(percent) => {
+                            println!("{indentation}  Repetition period tolerance: {percent}%")
+                        }
+                        TimeRangeTolerance::Absolute(abstol) => {
+                            println!("{indentation}  Repetition period tolerance: {abstol} s")
                         }
                     }
                 }
+            }
         }
     }
     let mut signals = FxHashMap::<String, (String, Option<i64>, Option<i64>)>::default();
@@ -951,10 +952,11 @@ fn display_isignal_group(
             .filter(|elem| elem.element_name() == ElementName::ISignalRef)
         {
             if let Some(CharacterData::String(path)) = isignal_ref.character_data()
-                && let Some(siginfo) = signals.get(&path) {
-                    sig_group_signals.push(siginfo.clone());
-                    signals.remove(&path);
-                }
+                && let Some(siginfo) = signals.get(&path)
+            {
+                sig_group_signals.push(siginfo.clone());
+                signals.remove(&path);
+            }
         }
     }
     // sort and display the group signals
@@ -1058,25 +1060,25 @@ fn display_nm_pdu(pdu: &Element, indent: usize) {
         && let Some(signal) = mapping
             .get_sub_element(ElementName::ISignalRef)
             .and_then(|elem| elem.get_reference_target().ok())
+    {
+        let name = signal.item_name().unwrap();
+        print!("{indentation}Nm-Signal: {name}");
+        if let Some(start_pos) = mapping
+            .get_sub_element(ElementName::StartPosition)
+            .and_then(|elem| elem.character_data())
+            .and_then(|cdata| cdata.parse_integer::<i64>())
         {
-            let name = signal.item_name().unwrap();
-            print!("{indentation}Nm-Signal: {name}");
-            if let Some(start_pos) = mapping
-                .get_sub_element(ElementName::StartPosition)
-                .and_then(|elem| elem.character_data())
-                .and_then(|cdata| cdata.parse_integer::<i64>())
-            {
-                print!(", start pos: {start_pos}");
-            }
-            if let Some(length) = signal
-                .get_sub_element(ElementName::Length)
-                .and_then(|elem| elem.character_data())
-                .and_then(|cdata| cdata.parse_integer::<i64>())
-            {
-                print!(", length: {length} bit");
-            }
-            println!();
+            print!(", start pos: {start_pos}");
         }
+        if let Some(length) = signal
+            .get_sub_element(ElementName::Length)
+            .and_then(|elem| elem.character_data())
+            .and_then(|cdata| cdata.parse_integer::<i64>())
+        {
+            print!(", length: {length} bit");
+        }
+        println!();
+    }
 }
 
 // <CONTAINER-I-PDU>
@@ -1242,9 +1244,10 @@ fn display_ethernet_channel(channel: &Element) -> Option<()> {
 fn display_ethernet_pdus(pdu_triggerings: &Element) -> Option<()> {
     for pdu_triggering in pdu_triggerings.sub_elements() {
         if display_ethernet_pdu(&pdu_triggering).is_none()
-            && let Ok(path) = pdu_triggering.path() {
-                println!("!!! inconsistent ethernet PDU triggering: {path}");
-            }
+            && let Ok(path) = pdu_triggering.path()
+        {
+            println!("!!! inconsistent ethernet PDU triggering: {path}");
+        }
     }
     println!();
     Some(())
