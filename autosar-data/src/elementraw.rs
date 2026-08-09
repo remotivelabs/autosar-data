@@ -839,6 +839,13 @@ impl ElementRaw {
         model.fix_element_paths(&remap);
         model.fix_reference_paths(&remap, version)?;
 
+        // reset the file membership of the moved element and all its sub elements: there's no guarantee that the
+        // moved element shares any files with its new parent, so the parent might be skipped for all files that
+        // the moved element would be written to, causing it to be lost.
+        for (_, elem) in move_element.elements_dfs() {
+            elem.0.write().file_membership.clear();
+        }
+
         // insert move_element
         self.content
             .insert(position, ElementContent::Element(move_element.clone()));
@@ -949,6 +956,11 @@ impl ElementRaw {
                 old_ref
             };
             model.add_reference_origin(&refstr, base.as_deref(), ref_element.downgrade());
+        }
+
+        // reset the file membership of the moved element and all its sub elements to None, since they are now part of a different model
+        for (_, elem) in move_element.elements_dfs() {
+            elem.0.write().file_membership.clear();
         }
 
         // insert move_element
