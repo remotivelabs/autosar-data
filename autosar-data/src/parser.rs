@@ -162,6 +162,15 @@ pub enum ArxmlParserError {
         attribute: AttributeName,
     },
 
+    /// An attribute occurs multiple times in the same element, which is not allowed
+    #[error("The attribute {attribute} occurs multiple times in the element {element}")]
+    DuplicateAttributeError {
+        /// The name of the attribute that occurs multiple times
+        attribute: AttributeName,
+        /// The name of the element where the attribute occurs multiple times
+        element: ElementName,
+    },
+
     /// Character content was found inside an element that does not allow it
     #[error("Character content found, which is not allowed inside element {element}")]
     CharacterContentForbidden {
@@ -693,7 +702,7 @@ impl<'a> ArxmlParser<'a> {
         elemtype: ElementType,
         attributes_text: &[u8],
     ) -> Result<SmallVec<[Attribute; 1]>, AutosarDataError> {
-        let mut attributes = SmallVec::new();
+        let mut attributes: SmallVec<[Attribute; 1]> = SmallVec::new();
         // attributes_text is a byte string containing all the attributes of an element
         // for example: xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_4-2-2.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         let startpos = attributes_text
@@ -741,10 +750,21 @@ impl<'a> ArxmlParser<'a> {
                         },
                     )?;
                     let attr_value = self.parse_character_data(attr_value_part, ctype)?;
-                    attributes.push(Attribute {
-                        attrname: attr_name,
-                        content: attr_value,
-                    });
+                    if let Some(pos) = attributes
+                        .iter()
+                        .position(|attr: &Attribute| attr.attrname == attr_name)
+                    {
+                        self.optional_error(ArxmlParserError::DuplicateAttributeError {
+                            element: self.current_element,
+                            attribute: attr_name,
+                        })?;
+                        attributes[pos].content = attr_value;
+                    } else {
+                        attributes.push(Attribute {
+                            attrname: attr_name,
+                            content: attr_value,
+                        });
+                    }
                 } else {
                     self.optional_error(ArxmlParserError::UnknownAttributeError {
                         element: self.current_element,
@@ -825,40 +845,34 @@ impl<'a> ArxmlParser<'a> {
                 regex,
                 max_length,
             } => {
-                if max_length.is_some() && trimmed_input.len() > max_length.unwrap() {
+                let text = match std::str::from_utf8(trimmed_input) {
+                    Ok(utf8string) => Cow::Borrowed(utf8string),
+                    Err(err) => {
+                        self.optional_error(ArxmlParserError::Utf8Error { source: err })?;
+                        String::from_utf8_lossy(trimmed_input)
+                    }
+                };
+                // unescape the string before checking length and regex match, since unescape is part of parsing, while the checks are part of validation.
+                let unescaped_text = self.unescape_string(&text)?.into_owned();
+                if max_length.is_some() && unescaped_text.len() > max_length.unwrap() {
                     self.optional_error(ArxmlParserError::StringValueTooLong {
-                        value: String::from_utf8_lossy(trimmed_input).to_string(),
+                        value: String::from_utf8_lossy(trimmed_input).to_string(), // use the raw value for the error message
                         length: max_length.unwrap(),
                     })?;
                 }
-                if !check_fn(trimmed_input) {
+                if !check_fn(unescaped_text.as_bytes()) {
                     self.optional_error(ArxmlParserError::RegexMatchError {
-                        value: String::from_utf8_lossy(trimmed_input).to_string(),
+                        value: String::from_utf8_lossy(trimmed_input).to_string(), // use the raw value for the error message
                         regex: (*regex).to_string(),
                     })?;
                 }
-                // text with regex pattern validation doesn't need unescaping - none of the regexes will allow any of the escaped chars
-                match std::str::from_utf8(trimmed_input) {
-                    Ok(utf8string) => Ok(CharacterData::String(utf8string.to_owned())),
-                    Err(err) => {
-                        self.optional_error(ArxmlParserError::Utf8Error { source: err })?;
-                        Ok(CharacterData::String(
-                            String::from_utf8_lossy(trimmed_input).into_owned(),
-                        ))
-                    }
-                }
+                Ok(CharacterData::String(unescaped_text))
             }
             CharacterDataSpec::String {
                 preserve_whitespace,
                 max_length,
             } => {
                 let raw_text = if *preserve_whitespace { input } else { trimmed_input };
-                if max_length.is_some() && raw_text.len() > max_length.unwrap() {
-                    self.optional_error(ArxmlParserError::StringValueTooLong {
-                        value: String::from_utf8_lossy(trimmed_input).to_string(),
-                        length: max_length.unwrap(),
-                    })?;
-                }
                 let text = match std::str::from_utf8(raw_text) {
                     Ok(utf8string) => Cow::from(utf8string),
                     Err(err) => {
@@ -867,6 +881,12 @@ impl<'a> ArxmlParser<'a> {
                     }
                 };
                 let unescaped_text = self.unescape_string(&text)?.into_owned();
+                if max_length.is_some() && unescaped_text.len() > max_length.unwrap() {
+                    self.optional_error(ArxmlParserError::StringValueTooLong {
+                        value: String::from_utf8_lossy(trimmed_input).to_string(),
+                        length: max_length.unwrap(),
+                    })?;
+                }
                 Ok(CharacterData::String(unescaped_text))
             }
             CharacterDataSpec::UnsignedInteger => {
@@ -1859,5 +1879,15 @@ mod test {
         assert_eq!(value.len(), 2);
         assert_eq!(value[0].attrname, AttributeName::Uuid);
         assert_eq!(value[1].attrname, AttributeName::T);
+
+        // duplicate attribute error
+        let result = parser.parse_attribute_text(etype_arpackage, br#" UUID="1"  UUID="2""#);
+        assert!(matches!(
+            result,
+            Err(AutosarDataError::ParserError {
+                source: ArxmlParserError::DuplicateAttributeError { .. },
+                ..
+            })
+        ));
     }
 }
