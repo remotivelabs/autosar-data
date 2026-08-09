@@ -456,7 +456,7 @@ pub enum ElementContent {
 /// In the xml string ```<SHORT-NAME>SomeName</SHORT-NAME>``` the character data
 /// "`SomeName`" will be loaded as `CharacterData::String("SomeName`"), while the content of the
 /// attribute <... DEST="UNIT"> will be loaded as `CharacterData::Enum(EnumItem::Unit`)
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub enum CharacterData {
     /// Character data is an enum value
     Enum(EnumItem),

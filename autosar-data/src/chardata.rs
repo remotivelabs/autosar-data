@@ -43,7 +43,9 @@ impl CharacterData {
                 }
             }
             CharacterDataSpec::Float => {
-                if let CharacterData::Float(_) = &value {
+                if let CharacterData::Float(floatval) = &value
+                    && !(floatval.is_nan() || floatval.is_infinite())
+                {
                     return true;
                 }
             }
@@ -105,7 +107,9 @@ impl CharacterData {
                 }
             }
             CharacterDataSpec::Float => {
-                if let Ok(value) = input.parse() {
+                if let Ok(value) = input.parse::<f64>()
+                    && !(value.is_infinite() || value.is_nan())
+                {
                     return Some(CharacterData::Float(value));
                 }
             }
@@ -353,6 +357,15 @@ impl Display for CharacterData {
     }
 }
 
+/// PartialEq for CharacterData, which overrides the default float comparison behavior so that NaN == NaN and Inf == Inf.
+impl PartialEq for CharacterData {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+/// total order for CharacterData, which overrides the default float comparison behavior so that NaN == NaN and Inf == Inf.
+/// Rust's default makes sense for numerical code, but we only want to compare and sort XML subtrees.
 impl Ord for CharacterData {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // compare two CharacterData values
@@ -362,7 +375,7 @@ impl Ord for CharacterData {
             (CharacterData::Enum(a), CharacterData::Enum(b)) => a.to_str().cmp(b.to_str()),
             (CharacterData::String(a), CharacterData::String(b)) => a.cmp(b),
             (CharacterData::UnsignedInteger(a), CharacterData::UnsignedInteger(b)) => a.cmp(b),
-            (CharacterData::Float(a), CharacterData::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+            (CharacterData::Float(a), CharacterData::Float(b)) => a.total_cmp(b),
             (CharacterData::Enum(_), _) => std::cmp::Ordering::Less,
             (CharacterData::String(_), CharacterData::Enum(_)) => std::cmp::Ordering::Greater,
             (CharacterData::String(_), _) => std::cmp::Ordering::Less,

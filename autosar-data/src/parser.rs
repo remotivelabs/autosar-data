@@ -872,8 +872,8 @@ impl<'a> ArxmlParser<'a> {
                 let strval = std::str::from_utf8(trimmed_input)
                     .map_err(|err| self.error(ArxmlParserError::Utf8Error { source: err }))?;
                 let value = match strval.parse::<f64>() {
-                    Ok(parsed) => parsed,
-                    Err(_) => {
+                    Ok(parsed) if !(parsed.is_infinite() || parsed.is_nan()) => parsed,
+                    _ => {
                         self.optional_error(ArxmlParserError::InvalidNumber {
                             input: strval.to_owned(),
                         })?;
