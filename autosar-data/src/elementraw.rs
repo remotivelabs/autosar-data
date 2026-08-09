@@ -432,7 +432,24 @@ impl ElementRaw {
             other_element.elemname
         };
         let (_, end) = self.calc_element_insert_range(other_elemname, version)?;
-        self.create_copied_sub_element_inner(self_weak, other, end, model, version)
+        self.create_copied_sub_element_inner(self_weak, other, end, model, Some(version))
+    }
+
+    /// create an exact deep copy of the given element and append it to the content of this element
+    ///
+    /// Unlike `create_copied_sub_element`, nothing is filtered out: the copy contains every sub
+    /// element and attribute of the original. This is needed by `AutosarModel::duplicate`, which
+    /// reproduces an existing model and we already know all elements and attributes are valid.
+    pub(crate) fn create_copied_sub_element_unfiltered(
+        &mut self,
+        self_weak: WeakElement,
+        other: &Element,
+        model: &AutosarModel,
+    ) -> Result<Element, AutosarDataError> {
+        // the sub elements are copied in the order in which they appear in the original, so
+        // appending each of them reproduces that order; no insert position needs to be calculated
+        let position = self.content.len();
+        self.create_copied_sub_element_inner(self_weak, other, position, model, None)
     }
 
     /// create a deep copy of the given element and insert it as a sub-element at the given position
@@ -451,19 +468,21 @@ impl ElementRaw {
         };
         let (start_pos, end_pos) = self.calc_element_insert_range(other_elemname, version)?;
         if start_pos <= position && position <= end_pos {
-            self.create_copied_sub_element_inner(self_weak, other, position, model, version)
+            self.create_copied_sub_element_inner(self_weak, other, position, model, Some(version))
         } else {
             Err(AutosarDataError::InvalidPosition)
         }
     }
 
+    /// `version` selects which parts of `other` are copied: `Some(version)` keeps only the sub
+    /// elements and attributes which are valid in that version, `None` copies everything
     fn create_copied_sub_element_inner(
         &mut self,
         self_weak: WeakElement,
         other: &Element,
         position: usize,
         model: &AutosarModel,
-        version: AutosarVersion,
+        version: Option<AutosarVersion>,
     ) -> Result<Element, AutosarDataError> {
         // check if self (target of the move) is a sub element of new_element
         // if it is, then the move is not allowed
@@ -521,8 +540,11 @@ impl ElementRaw {
         Ok(newelem)
     }
 
-    /// perform a deep copy of an element, but keep only those sub elements etc, which are compatible with `target_version`
-    fn deep_copy(&self, target_version: AutosarVersion) -> Result<Element, AutosarDataError> {
+    /// perform a deep copy of an element
+    ///
+    /// If `target_version` is `Some`, then only those sub elements and attributes which are
+    /// compatible with that version are copied. If it is `None`, then the copy is exact.
+    fn deep_copy(&self, target_version: Option<AutosarVersion>) -> Result<Element, AutosarDataError> {
         let copy_wrapped = ElementRaw {
             elemname: self.elemname,
             elemtype: self.elemtype,
@@ -537,32 +559,37 @@ impl ElementRaw {
         {
             let mut copy = copy_wrapped.0.write();
             // copy all the attributes
-            for attribute in &self.attributes {
-                // get the specification of the attribute
-                let AttributeSpec {
-                    spec: cdataspec,
-                    required,
-                    version: attr_version_mask,
-                } = self.elemtype.find_attribute_spec(attribute.attrname).ok_or(
-                    AutosarDataError::VersionIncompatibleData {
-                        version: target_version,
-                    },
-                )?;
-                // check if the attribute is compatible with the target version
-                if target_version.compatible(attr_version_mask)
-                    && attribute
-                        .content
-                        .check_version_compatibility(cdataspec, target_version)
-                        .0
-                {
-                    copy.attributes.push(attribute.clone());
-                } else if required {
-                    return Err(AutosarDataError::VersionIncompatibleData {
-                        version: target_version,
-                    });
-                } else {
-                    // no action, the attribute is not compatible, but it's not required either
+            if let Some(target_version) = target_version {
+                for attribute in &self.attributes {
+                    // get the specification of the attribute
+                    let AttributeSpec {
+                        spec: cdataspec,
+                        required,
+                        version: attr_version_mask,
+                    } = self.elemtype.find_attribute_spec(attribute.attrname).ok_or(
+                        AutosarDataError::VersionIncompatibleData {
+                            version: target_version,
+                        },
+                    )?;
+                    // check if the attribute is compatible with the target version
+                    if target_version.compatible(attr_version_mask)
+                        && attribute
+                            .content
+                            .check_version_compatibility(cdataspec, target_version)
+                            .0
+                    {
+                        copy.attributes.push(attribute.clone());
+                    } else if required {
+                        return Err(AutosarDataError::VersionIncompatibleData {
+                            version: target_version,
+                        });
+                    } else {
+                        // no action, the attribute is not compatible, but it's not required either
+                    }
                 }
+            } else {
+                // exact copy: each attribute is valid wherever the original element is valid
+                copy.attributes.clone_from(&self.attributes);
             }
 
             // copy all content: sub elements and text items
@@ -571,12 +598,12 @@ impl ElementRaw {
                     ElementContent::Element(sub_elem) => {
                         let sub_elem_name = sub_elem.element_name();
                         // since find_sub_element already considers the version, finding the element also means it's valid in the target_version
-                        if self
-                            .elemtype
-                            .find_sub_element(sub_elem_name, target_version as u32)
-                            .is_some()
-                            && let Ok(copied_sub_elem) = sub_elem.0.read().deep_copy(target_version)
-                        {
+                        let compatible = target_version.is_none_or(|target_version| {
+                            self.elemtype
+                                .find_sub_element(sub_elem_name, target_version as u32)
+                                .is_some()
+                        });
+                        if compatible && let Ok(copied_sub_elem) = sub_elem.0.read().deep_copy(target_version) {
                             copied_sub_elem.0.write().parent = ElementOrModel::Element(copy_wrapped.downgrade());
                             copy.content.push(ElementContent::Element(copied_sub_elem));
                         }

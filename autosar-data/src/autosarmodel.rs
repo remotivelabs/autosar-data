@@ -915,19 +915,28 @@ impl AutosarModel {
         // by inserting copies of the sub elements of <AUTOSAR>, we automatically
         // get up-to-date identifiables and reference_origins
         for element in self.root_element().sub_elements() {
-            copy.root_element().create_copied_sub_element(&element)?;
+            let copy_root = copy.root_element();
+            let root_weak = copy_root.downgrade();
+            copy_root
+                .0
+                .write()
+                .create_copied_sub_element_unfiltered(root_weak, &element, &copy)?;
         }
 
         // the copies contain unresolved relative references, since a reference base can only be
         // resolved once the whole tree is in place
         copy.resolve_relative_references();
 
-        // `create_copied_sub_element` does not transfer information about file membership
-        // this needs to be added back
+        // `create_copied_sub_element_unfiltered` does not transfer information about file
+        // membership, so this needs to be added back.
         let orig_iter = self.elements_dfs();
         let copy_iter = copy.elements_dfs();
         let combined = std::iter::zip(orig_iter, copy_iter);
         for ((_, orig_elem), (_, copy_elem)) in combined {
+            // If the copy ever stopped being exact, the two iterators would run out of step and the
+            // file membership would be written to the wrong elements, which silently moves elements
+            // from one file to another.
+            debug_assert_eq!(orig_elem.element_name(), copy_elem.element_name());
             let mut locked_copy = copy_elem.0.try_write().ok_or(AutosarDataError::ParentElementLocked)?;
             locked_copy.file_membership.clear();
 
@@ -2244,6 +2253,51 @@ mod test {
         assert_eq!(file2.filename(), model2_file2.filename());
         assert_eq!(file1.serialize().unwrap(), model2_file1.serialize().unwrap());
         assert_eq!(file2.serialize().unwrap(), model2_file2.serialize().unwrap());
+    }
+
+    /// duplicate() must copy a model with files of different versions exactly
+    ///
+    /// Each file of the copy keeps the version of the original file, so every element is valid
+    /// where it ends up. Filtering the copy by any single version loses data: the oldest version
+    /// of the model does not permit the elements which were added in later versions, and the
+    /// newest version does not permit the elements which were removed again before it.
+    #[test]
+    fn duplicate_mixed_versions() {
+        // PORT-BLUEPRINT exists in AUTOSAR 4.0.1, but was removed in later versions
+        const FILEBUF_OLD: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_4-0-1.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>PkgOld</SHORT-NAME><ELEMENTS>
+          <PORT-BLUEPRINT><SHORT-NAME>Blueprint</SHORT-NAME></PORT-BLUEPRINT>
+        </ELEMENTS></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#.as_bytes();
+        // ADAPTIVE-APPLICATION-SW-COMPONENT-TYPE was only added after 4.0.1
+        const FILEBUF_NEW: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>PkgNew</SHORT-NAME><ELEMENTS>
+          <ADAPTIVE-APPLICATION-SW-COMPONENT-TYPE><SHORT-NAME>Adaptive</SHORT-NAME></ADAPTIVE-APPLICATION-SW-COMPONENT-TYPE>
+        </ELEMENTS></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#.as_bytes();
+
+        let model = AutosarModel::new();
+        let (file_old, _) = model.load_buffer(FILEBUF_OLD, "old.arxml", true).unwrap();
+        let (file_new, _) = model.load_buffer(FILEBUF_NEW, "new.arxml", true).unwrap();
+
+        let copy = model.duplicate().unwrap();
+
+        // an element which only exists in versions older than the newest file must not be dropped
+        assert!(copy.get_element_by_path("/PkgOld/Blueprint").is_some());
+        // an element which only exists in versions newer than the oldest file must not be dropped
+        assert!(copy.get_element_by_path("/PkgNew/Adaptive").is_some());
+        assert_eq!(model.elements_dfs().count(), copy.elements_dfs().count());
+
+        // The file membership must end up on the same elements as in the original. If any element
+        // were dropped from the copy, then the file membership would be shifted onto the wrong
+        // elements, and the files would no longer contain the same data.
+        assert_eq!(copy.files().count(), 2);
+        let copy_old = copy.files().find(|f| f.filename() == file_old.filename()).unwrap();
+        let copy_new = copy.files().find(|f| f.filename() == file_new.filename()).unwrap();
+        assert_eq!(copy_old.version(), AutosarVersion::Autosar_4_0_1);
+        assert_eq!(copy_new.version(), AutosarVersion::Autosar_00050);
+        assert_eq!(copy_old.serialize().unwrap(), file_old.serialize().unwrap());
+        assert_eq!(copy_new.serialize().unwrap(), file_new.serialize().unwrap());
     }
 
     #[test]
