@@ -523,6 +523,21 @@ impl<'a> ArxmlParser<'a> {
                     }));
                 }
                 ArxmlEvent::Characters(text_content) => {
+                    // Known limitation: a comment (or a processing instruction) in the middle of
+                    // character data splits it into several Characters events, and each of them is
+                    // stored as a separate content item. According to the xml specification the
+                    // parts form a single value, so <SHORT-NAME>ab<!--x-->cd</SHORT-NAME> should be
+                    // read as "abcd". Instead the element ends up with two content items, which
+                    // breaks the assumption that an element with ContentMode::Characters holds
+                    // exactly one item: character_data() returns None, the Autosar path is built
+                    // from the first part only, and serializing writes just the first part.
+                    // This is not handled, because arxml is written by tools, which - in every
+                    // observed case - either write no comments at all or place them immediately
+                    // before an element, never inside character data.
+                    // Handling it requires collecting the parts and parsing them only once the run
+                    // of character data ends: parsing each part on its own does not work, since an
+                    // incomplete part may be rejected by the character data spec (e.g. the first
+                    // part "/Pkg/" of a reference does not match the reference regex).
                     if let Some(character_data_spec) = element.elemtype.chardata_spec() {
                         let value = self.parse_character_data(text_content, character_data_spec)?;
                         if element.elemtype.is_ref()
