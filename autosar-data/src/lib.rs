@@ -272,6 +272,15 @@ pub enum AutosarDataError {
         element: ElementName,
     },
 
+    /// An element accepts character data, but the given character data is not valid for this element
+    #[error("Invalid character data for element {}: {}", .element, .value)]
+    InvalidCharacterData {
+        /// The element where the character data is invalid
+        element: ElementName,
+        /// The invalid character data
+        value: String,
+    },
+
     /// Could not insert a sub element, because it conflicts with an existing sub element
     #[error("Element insertion conflict: {} could not be inserted in {} ({})", .element, .parent, .parent_path)]
     ElementInsertionConflict {

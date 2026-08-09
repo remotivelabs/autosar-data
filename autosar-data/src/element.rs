@@ -1217,6 +1217,8 @@ impl Element {
     ///  - [`AutosarDataError::ParentElementLocked`]: a parent element was locked and did not become available after waiting briefly.
     ///    The operation was aborted to avoid a deadlock, but can be retried.
     ///  - [`AutosarDataError::IncorrectContentType`]: Cannot set character data on an element which does not contain character data
+    ///  - [`AutosarDataError::InvalidCharacterData`]: The character data is not valid for this element - wrong type, or does not match the
+    ///    pattern or string restrictions of the element type
     pub fn set_character_data<T: Into<CharacterData>>(&self, value: T) -> Result<(), AutosarDataError> {
         let chardata: CharacterData = value.into();
         self.set_character_data_internal(chardata)
@@ -1293,12 +1295,18 @@ impl Element {
                 // REFERENCE-BASE, which changes what the relative references in its scope resolve to.
                 model.resolve_relative_references();
 
-                return Ok(());
+                Ok(())
+            } else {
+                Err(AutosarDataError::InvalidCharacterData {
+                    element: self.element_name(),
+                    value: chardata.to_string(),
+                })
             }
+        } else {
+            Err(AutosarDataError::IncorrectContentType {
+                element: self.element_name(),
+            })
         }
-        Err(AutosarDataError::IncorrectContentType {
-            element: self.element_name(),
-        })
     }
 
     /// Remove the character data of this element
