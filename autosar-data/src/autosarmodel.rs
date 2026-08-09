@@ -11,6 +11,33 @@ enum MergeAction {
     BOnly(usize),
 }
 
+// a single mutation performed by the merge, which can be undone again
+//
+// merge_sub_elements can recover from a failed merge of two elements by importing the element
+// of the incoming file as an additional sub element instead. That is only correct if the failed
+// merge is undone first: the merge works in-place, so by the time it fails it may already have
+// moved sub elements of the incoming element into the existing element. Without the rollback
+// these sub elements would end up in the content of both elements at once.
+enum MergeUndo {
+    // an element of the incoming file was moved into the content of new_parent
+    Imported {
+        new_parent: Element,
+        element: Element,
+        old_parent: ElementOrModel,
+        old_file_membership: HashSet<WeakArxmlFile>,
+    },
+    // the file membership of an existing element was replaced
+    FileMembership {
+        element: Element,
+        old_file_membership: HashSet<WeakArxmlFile>,
+    },
+    // a single file was added to the non-empty file membership of an existing element
+    FileMembershipExtended {
+        element: Element,
+        file: WeakArxmlFile,
+    },
+}
+
 /// Replace `old_prefix` with `new_prefix` in `path`.
 ///
 /// Returns `None` if `path` is neither `old_prefix` itself nor nested inside it. Unlike a plain
@@ -322,7 +349,11 @@ impl AutosarModel {
         let root = self.root_element();
         let files: HashSet<WeakArxmlFile> = file_list.iter().map(ArxmlFile::downgrade).collect();
 
-        Self::merge_element(&root, &files, new_root, &new_file).map_err(|e| {
+        // log of all mutations performed by the merge, so that merge_sub_elements can undo the
+        // partial merge of a pair of elements which turns out to be unmergeable
+        let mut undo = Vec::new();
+
+        Self::merge_element(&root, &files, new_root, &new_file, &mut undo).map_err(|e| {
             // transform ElementInsertionConflict into InvalidFileMerge
             if let AutosarDataError::ElementInsertionConflict { parent_path, .. } = &e {
                 AutosarDataError::InvalidFileMerge {
@@ -343,6 +374,7 @@ impl AutosarModel {
         files: &HashSet<WeakArxmlFile>,
         parent_b: &Element,
         new_file: &WeakArxmlFile,
+        undo: &mut Vec<MergeUndo>,
     ) -> Result<(), AutosarDataError> {
         let mut iter_a = parent_a.sub_elements().enumerate();
         let mut iter_b = parent_b.sub_elements();
@@ -442,18 +474,28 @@ impl AutosarModel {
         // elements in elements_a_only are already present in the model, so they only need to be restricted
         for element in elements_a_only {
             // files contains the permisions of the parent
-            let mut elem_locked = element.0.write();
-            if elem_locked.file_membership.is_empty() {
-                files.clone_into(&mut elem_locked.file_membership);
+            let restricted = {
+                let mut elem_locked = element.0.write();
+                let restricted = elem_locked.file_membership.is_empty();
+                if restricted {
+                    files.clone_into(&mut elem_locked.file_membership);
+                }
+                restricted
+            };
+            if restricted {
+                undo.push(MergeUndo::FileMembership {
+                    element,
+                    old_file_membership: HashSet::new(),
+                });
             }
         }
 
         // elements in elements_b_only are not present in the model yet, so they need to be added
         // this step can fail, in which case the merge of this element fails
-        Self::import_new_items(parent_a, elements_b_only, new_file, min_ver_b)?;
+        Self::import_new_items(parent_a, elements_b_only, new_file, min_ver_b, undo)?;
 
         // recurse for sub elements that are present on both sides: these need to be checked and merged
-        Self::merge_sub_elements(parent_a, elements_merge, files, new_file, version)?;
+        Self::merge_sub_elements(parent_a, elements_merge, files, new_file, version, undo)?;
 
         Ok(())
     }
@@ -563,13 +605,14 @@ impl AutosarModel {
         elements_b_only: Vec<(Element, usize)>,
         new_file: &WeakArxmlFile,
         version: AutosarVersion,
+        undo: &mut Vec<MergeUndo>,
     ) -> Result<(), AutosarDataError> {
         // elements in elements_b_only are not present in the model yet, so they need to be added
         for (idx, (new_element, insert_pos)) in elements_b_only.into_iter().enumerate() {
             // idx number of elements have already been inserted, so the destination position must be adjusted
             let dest = insert_pos + idx;
 
-            Self::import_single_item(parent_a, new_element, dest, new_file, version)?;
+            Self::import_single_item(parent_a, new_element, dest, new_file, version, undo)?;
         }
         Ok(())
     }
@@ -580,20 +623,35 @@ impl AutosarModel {
         dest: usize,
         new_file: &WeakArxmlFile,
         version: AutosarVersion,
+        undo: &mut Vec<MergeUndo>,
     ) -> Result<(), AutosarDataError> {
         let mut parent_a_locked = parent_a.0.write();
-        let weak_parent_a = parent_a.downgrade();
-
-        new_element.set_parent(ElementOrModel::Element(weak_parent_a));
-        // restrict new_element, it is only present in new_file
-        new_element.0.write().file_membership.insert(new_file.clone());
 
         // add the new_element (from side b) to the content of parent_a
-        // to do this, first check valid element insertion positions
+        // to do this, first check valid element insertion positions. Nothing may be modified
+        // before this fallible step, so that a failed import leaves new_element untouched
         let (first_pos, last_pos) = parent_a_locked.calc_element_insert_range(new_element.element_name(), version)?;
 
         // clamp dest, so that first_pos <= dest <= last_pos
         let dest = dest.max(first_pos).min(last_pos);
+
+        let (old_parent, old_file_membership) = {
+            let mut new_elem_locked = new_element.0.write();
+            let old_parent = std::mem::replace(
+                &mut new_elem_locked.parent,
+                ElementOrModel::Element(parent_a.downgrade()),
+            );
+            // restrict new_element, it is only present in new_file
+            let old_file_membership = new_elem_locked.file_membership.clone();
+            new_elem_locked.file_membership.insert(new_file.clone());
+            (old_parent, old_file_membership)
+        };
+        undo.push(MergeUndo::Imported {
+            new_parent: parent_a.clone(),
+            element: new_element.clone(),
+            old_parent,
+            old_file_membership,
+        });
 
         // insert the element from b at the calculated position
         parent_a_locked
@@ -603,12 +661,52 @@ impl AutosarModel {
         Ok(())
     }
 
+    // undo all merge actions recorded after the position mark, in reverse order
+    fn rollback_merge(undo: &mut Vec<MergeUndo>, mark: usize) {
+        for action in undo.drain(mark..).rev() {
+            match action {
+                MergeUndo::Imported {
+                    new_parent,
+                    element,
+                    old_parent,
+                    old_file_membership,
+                } => {
+                    // take the element out of the content of its new parent again
+                    let mut new_parent_locked = new_parent.0.write();
+                    if let Some(pos) = new_parent_locked
+                        .content
+                        .iter()
+                        .position(|item| matches!(item, ElementContent::Element(e) if *e == element))
+                    {
+                        new_parent_locked.content.remove(pos);
+                    }
+                    drop(new_parent_locked);
+                    // the element is still in the content of its original parent, so the
+                    // parent reference must point there again
+                    let mut elem_locked = element.0.write();
+                    elem_locked.set_parent(old_parent);
+                    elem_locked.file_membership = old_file_membership;
+                }
+                MergeUndo::FileMembership {
+                    element,
+                    old_file_membership,
+                } => {
+                    element.0.write().file_membership = old_file_membership;
+                }
+                MergeUndo::FileMembershipExtended { element, file } => {
+                    element.0.write().file_membership.remove(&file);
+                }
+            }
+        }
+    }
+
     fn merge_sub_elements(
         parent_a: &Element,
         elements_merge: Vec<(Element, Element)>,
         files: &HashSet<WeakArxmlFile>,
         new_file: &WeakArxmlFile,
         version: AutosarVersion,
+        undo: &mut Vec<MergeUndo>,
     ) -> Result<(), AutosarDataError> {
         for (elem_a, elem_b) in elements_merge {
             // get the list of files that the element from a is present in
@@ -618,14 +716,22 @@ impl AutosarModel {
                 files.clone()
             };
 
-            // merge the two elements
-            let result = AutosarModel::merge_element(&elem_a, &files, &elem_b, new_file);
+            // merge the two elements; remember where the actions of this merge start in the
+            // undo log, so that the merge can be rolled back if it fails
+            let undo_mark = undo.len();
+            let result = AutosarModel::merge_element(&elem_a, &files, &elem_b, new_file, undo);
             match result {
                 Ok(()) => {
                     // update the file membership of the merged element, if there was any
                     let mut elem_a_locked = elem_a.0.write();
-                    if !elem_a_locked.file_membership.is_empty() {
-                        elem_a_locked.file_membership.insert(new_file.clone());
+                    if !elem_a_locked.file_membership.is_empty()
+                        && elem_a_locked.file_membership.insert(new_file.clone())
+                    {
+                        drop(elem_a_locked);
+                        undo.push(MergeUndo::FileMembershipExtended {
+                            element: elem_a.clone(),
+                            file: new_file.clone(),
+                        });
                     }
                 }
                 Err(e) => {
@@ -642,10 +748,21 @@ impl AutosarModel {
                                 path: parent_path.clone(),
                             });
                         } else if parent_a.element_type().splittable_in(version) {
+                            // undo the partial merge: the failed merge_element may already have
+                            // moved sub elements of elem_b into elem_a. These must be returned to
+                            // elem_b, otherwise they would be part of both elements at once
+                            Self::rollback_merge(undo, undo_mark);
+
+                            let old_file_membership = elem_a.0.read().file_membership.clone();
                             elem_a.set_file_membership(files);
+                            undo.push(MergeUndo::FileMembership {
+                                element: elem_a.clone(),
+                                old_file_membership,
+                            });
+
                             // try to import elem_b as a new item instead
                             let dest = elem_a.position().unwrap_or_default() + 1;
-                            Self::import_single_item(parent_a, elem_b, dest, new_file, version).map_err(|_| e)?;
+                            Self::import_single_item(parent_a, elem_b, dest, new_file, version, undo).map_err(|_| e)?;
                             // recovery succeeded: continue with the remaining elements
                             continue;
                         }
@@ -2486,6 +2603,105 @@ mod test {
         let (_, _) = model.load_buffer(FILEBUF1, "file1", true).unwrap();
         let result = model.load_buffer(FILEBUF2, "file2", true);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn data_merge_after_insertion_conflict() {
+        // Both files contain a PORT-API-OPTION. PORT-API-OPTION is neither identifiable nor
+        // does it have a DEFINITION-REF, so the two elements are paired for merging. The merge
+        // is not possible, because PORT-REF may only appear once and the two files disagree
+        // about its value. PORT-API-OPTIONS is splittable, so the element from the second file
+        // is added as an additional sub element instead.
+        // ENABLE-TAKE-ADDRESS and PORT-ARG-VALUES are unique to the second file and are already
+        // merged into the element of the first file when the conflict is detected; the recovery
+        // must undo this, otherwise these elements end up in both PORT-API-OPTIONs at once.
+        const FILEBUF1: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><ELEMENTS>
+          <SERVICE-SW-COMPONENT-TYPE><SHORT-NAME>Swc</SHORT-NAME>
+            <INTERNAL-BEHAVIORS><SWC-INTERNAL-BEHAVIOR><SHORT-NAME>Behavior</SHORT-NAME>
+              <PORT-API-OPTIONS>
+                <PORT-API-OPTION>
+                  <PORT-REF DEST="P-PORT-PROTOTYPE">/Pkg/Swc/PortA</PORT-REF>
+                </PORT-API-OPTION>
+              </PORT-API-OPTIONS>
+            </SWC-INTERNAL-BEHAVIOR></INTERNAL-BEHAVIORS>
+          </SERVICE-SW-COMPONENT-TYPE>
+        </ELEMENTS></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#.as_bytes();
+        const FILEBUF2: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><ELEMENTS>
+          <SERVICE-SW-COMPONENT-TYPE><SHORT-NAME>Swc</SHORT-NAME>
+            <INTERNAL-BEHAVIORS><SWC-INTERNAL-BEHAVIOR><SHORT-NAME>Behavior</SHORT-NAME>
+              <PORT-API-OPTIONS>
+                <PORT-API-OPTION>
+                  <ENABLE-TAKE-ADDRESS>true</ENABLE-TAKE-ADDRESS>
+                  <PORT-ARG-VALUES>
+                    <PORT-DEFINED-ARGUMENT-VALUE>
+                      <VALUE-TYPE-TREF DEST="IMPLEMENTATION-DATA-TYPE">/Pkg/SomeType</VALUE-TYPE-TREF>
+                    </PORT-DEFINED-ARGUMENT-VALUE>
+                  </PORT-ARG-VALUES>
+                  <PORT-REF DEST="P-PORT-PROTOTYPE">/Pkg/Swc/PortB</PORT-REF>
+                </PORT-API-OPTION>
+              </PORT-API-OPTIONS>
+            </SWC-INTERNAL-BEHAVIOR></INTERNAL-BEHAVIORS>
+          </SERVICE-SW-COMPONENT-TYPE>
+        </ELEMENTS></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#.as_bytes();
+
+        // serialize each file on its own; merging must not change the content of either file
+        let single_model = AutosarModel::new();
+        let (single_file1, _) = single_model.load_buffer(FILEBUF1, "file1.arxml", true).unwrap();
+        let file1_txt = single_file1.serialize().unwrap();
+        let single_model = AutosarModel::new();
+        let (single_file2, _) = single_model.load_buffer(FILEBUF2, "file2.arxml", true).unwrap();
+        let file2_txt = single_file2.serialize().unwrap();
+
+        let model = AutosarModel::new();
+        let (file1, _) = model.load_buffer(FILEBUF1, "file1.arxml", true).unwrap();
+        let (file2, _) = model.load_buffer(FILEBUF2, "file2.arxml", true).unwrap();
+
+        let el_port_api_options = model
+            .get_element_by_path("/Pkg/Swc/Behavior")
+            .and_then(|behavior| behavior.get_sub_element(ElementName::PortApiOptions))
+            .unwrap();
+        let options: Vec<Element> = el_port_api_options.sub_elements().collect();
+        // the two options could not be merged, so each of them exists on its own, one per file
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].file_membership().unwrap().1.len(), 1);
+        assert_eq!(options[1].file_membership().unwrap().1.len(), 1);
+
+        // the sub elements which are unique to file2 were returned to the option of file2 by the
+        // rollback, so each of them is present exactly once in the model
+        for element_name in [ElementName::EnableTakeAddress, ElementName::PortArgValues] {
+            let count = model
+                .elements_dfs()
+                .filter(|(_, elem)| elem.element_name() == element_name)
+                .count();
+            assert_eq!(count, 1, "{element_name} exists {count} times, expected 1");
+        }
+        // each option contains only the sub elements of its own file
+        let sub_elements_0: Vec<ElementName> = options[0].sub_elements().map(|e| e.element_name()).collect();
+        assert_eq!(sub_elements_0, vec![ElementName::PortRef]);
+        let sub_elements_1: Vec<ElementName> = options[1].sub_elements().map(|e| e.element_name()).collect();
+        assert_eq!(
+            sub_elements_1,
+            vec![
+                ElementName::EnableTakeAddress,
+                ElementName::PortArgValues,
+                ElementName::PortRef
+            ]
+        );
+
+        // the content of both files is unchanged by the merge
+        assert_eq!(file1.serialize().unwrap(), file1_txt);
+        assert_eq!(file2.serialize().unwrap(), file2_txt);
+
+        // load the files in the opposite order: the content of both files must still be unchanged
+        let model = AutosarModel::new();
+        let (file2, _) = model.load_buffer(FILEBUF2, "file2.arxml", true).unwrap();
+        let (file1, _) = model.load_buffer(FILEBUF1, "file1.arxml", true).unwrap();
+        assert_eq!(file1.serialize().unwrap(), file1_txt);
+        assert_eq!(file2.serialize().unwrap(), file2_txt);
     }
 
     // a model with three reference bases: two in the outer package "/BasesPkg", and one in
