@@ -4,6 +4,8 @@ use std::str::FromStr;
 
 use super::*;
 
+static LOCK_CONTENTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
+
 impl Element {
     /// Get the parent element of the current element
     ///
@@ -244,7 +246,7 @@ impl Element {
         // path() is frequently called on parent elements while a child lock is held,
         // so a blocking read() here could deadlock
         self.0
-            .try_read_for(std::time::Duration::from_millis(10))
+            .try_read_for(LOCK_CONTENTION_TIMEOUT)
             .ok_or(AutosarDataError::ParentElementLocked)?
             .path()
     }
@@ -283,7 +285,7 @@ impl Element {
             let parent = {
                 let element = cur_elem
                     .0
-                    .try_read_for(std::time::Duration::from_millis(10))
+                    .try_read_for(LOCK_CONTENTION_TIMEOUT)
                     .ok_or(AutosarDataError::ParentElementLocked)?;
                 match &element.parent {
                     ElementOrModel::Element(weak_parent) => {
@@ -292,7 +294,7 @@ impl Element {
                         let parent_name = {
                             let parent_lock = parent
                                 .0
-                                .try_read_for(std::time::Duration::from_millis(10))
+                                .try_read_for(LOCK_CONTENTION_TIMEOUT)
                                 .ok_or(AutosarDataError::ParentElementLocked)?;
                             parent_lock.element_name()
                         };
@@ -339,7 +341,7 @@ impl Element {
             let parent = {
                 let element = cur_elem
                     .0
-                    .try_read_for(std::time::Duration::from_millis(10))
+                    .try_read_for(LOCK_CONTENTION_TIMEOUT)
                     .ok_or(AutosarDataError::ParentElementLocked)?;
                 match &element.parent {
                     ElementOrModel::Element(weak_parent) => {
@@ -997,7 +999,7 @@ impl Element {
             if let Some(reference_bases) = package.try_get_sub_element(ElementName::ReferenceBases) {
                 let declarations: Vec<Element> = reference_bases
                     .0
-                    .try_read_for(std::time::Duration::from_millis(10))?
+                    .try_read_for(LOCK_CONTENTION_TIMEOUT)?
                     .content
                     .iter()
                     .filter_map(|item| match item {
@@ -1008,7 +1010,7 @@ impl Element {
                 for declaration in declarations {
                     if let Some((declared_label, package_ref, package_ref_base)) = declaration
                         .0
-                        .try_read_for(std::time::Duration::from_millis(10))?
+                        .try_read_for(LOCK_CONTENTION_TIMEOUT)?
                         .reference_base_declaration()
                         && declared_label == label
                     {
@@ -1025,12 +1027,12 @@ impl Element {
     ///
     /// Unlike [`Self::get_sub_element`] this can be used while the model lock is held.
     fn try_get_sub_element(&self, name: ElementName) -> Option<Element> {
-        let locked_element = self.0.try_read_for(std::time::Duration::from_millis(10))?;
+        let locked_element = self.0.try_read_for(LOCK_CONTENTION_TIMEOUT)?;
         for item in &locked_element.content {
             if let ElementContent::Element(sub_element) = item
                 && sub_element
                     .0
-                    .try_read_for(std::time::Duration::from_millis(10))?
+                    .try_read_for(LOCK_CONTENTION_TIMEOUT)?
                     .elemname
                     == name
             {
@@ -2180,7 +2182,7 @@ impl Element {
         while let Some(cur_elem) = &cur_elem_opt {
             let locked_cur_elem = cur_elem
                 .0
-                .try_read_for(std::time::Duration::from_millis(10))
+                .try_read_for(LOCK_CONTENTION_TIMEOUT)
                 .ok_or(AutosarDataError::ParentElementLocked)?;
             if !locked_cur_elem.file_membership.is_empty() {
                 return Ok((cur_elem == self, locked_cur_elem.file_membership.clone()));
@@ -2282,7 +2284,7 @@ impl Element {
             // which does not include the new file
             if self.element_type().splittable() != 0 {
                 for se in self.sub_elements() {
-                    if let Some(mut subelem) = se.0.try_write()
+                    if let Some(mut subelem) = se.0.try_write_for(LOCK_CONTENTION_TIMEOUT)
                         && subelem.file_membership.is_empty()
                     {
                         subelem.file_membership.clone_from(&current_fileset);
