@@ -1493,15 +1493,6 @@ impl AutosarModel {
 }
 
 impl AutosarModelRaw {
-    pub(crate) fn set_version(&mut self, new_ver: AutosarVersion) {
-        let attribute_value = CharacterData::String(format!("http://autosar.org/schema/r4.0 {}", new_ver.filename()));
-        let _ = self.root_element.0.write().set_attribute_internal(
-            AttributeName::xsiSchemalocation,
-            attribute_value,
-            new_ver,
-        );
-    }
-
     pub(crate) fn wrap(self) -> AutosarModel {
         AutosarModel(Arc::new(RwLock::new(self)))
     }

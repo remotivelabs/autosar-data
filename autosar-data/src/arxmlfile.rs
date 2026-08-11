@@ -227,12 +227,12 @@ impl ArxmlFile {
             Some(false) => outstring.push_str("<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"no\"?>"),
             None => outstring.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>"),
         }
-        model.0.write().set_version(self.0.read().version);
+        let file_version = self.0.read().version;
         model
             .root_element()
             .0
             .read()
-            .serialize_internal(&mut outstring, 0, false, &Some(self.downgrade()));
+            .serialize_internal(&mut outstring, 0, false, &Some(self.downgrade()), Some(file_version));
 
         Ok(outstring)
     }
@@ -418,6 +418,7 @@ mod test {
         let file = model.create_file("test", AutosarVersion::Autosar_00050).unwrap();
         assert_eq!(file.model().unwrap(), model);
         assert_eq!(model.root_element().element_name(), ElementName::Autosar);
+        assert_eq!(file.version(), AutosarVersion::Autosar_00050);
         let text = file.serialize().unwrap();
         assert_eq!(
             text,

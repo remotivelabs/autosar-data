@@ -2007,7 +2007,7 @@ impl Element {
     pub fn serialize(&self) -> String {
         let mut outstring = String::new();
 
-        self.0.read().serialize_internal(&mut outstring, 0, false, &None);
+        self.0.read().serialize_internal(&mut outstring, 0, false, &None, None);
 
         outstring
     }
@@ -4061,7 +4061,7 @@ mod test {
         el_autosar.set_comment(Some("comment".to_string()));
 
         let mut outstring = String::from(r#"<?xml version="1.0" encoding="utf-8"?>"#);
-        el_autosar.0.read().serialize_internal(&mut outstring, 0, false, &None);
+        el_autosar.0.read().serialize_internal(&mut outstring, 0, false, &None, None);
 
         assert_eq!(FILEBUF, outstring);
     }

@@ -1378,6 +1378,7 @@ impl ElementRaw {
         indent: usize,
         inline: bool,
         for_file: &Option<WeakArxmlFile>,
+        file_version: Option<AutosarVersion>,
     ) {
         let element_name = self.elemname.to_str();
 
@@ -1401,7 +1402,17 @@ impl ElementRaw {
         if !self.content.is_empty() {
             outstring.push('<');
             outstring.push_str(element_name);
-            self.serialize_attributes(outstring);
+            if let Some(file_version) = file_version && for_file.is_some() && self.element_name() == ElementName::Autosar {
+                let mut attributes = self.attributes.clone();
+                for attr in &mut attributes {
+                    if attr.attrname == AttributeName::xsiSchemalocation {
+                        attr.content = CharacterData::String(format!("http://autosar.org/schema/r4.0 {}", file_version.filename()));
+                    }
+                }
+                Self::serialize_attributes(&attributes, outstring);
+            } else {
+                Self::serialize_attributes(&self.attributes, outstring);
+            }
             outstring.push('>');
 
             match content_type {
@@ -1416,7 +1427,7 @@ impl ElementRaw {
                             subelem
                                 .0
                                 .read()
-                                .serialize_internal(outstring, indent + 1, false, for_file);
+                                .serialize_internal(outstring, indent + 1, false, for_file, file_version);
                         }
                     }
                     // put the closing tag on a new line and indent it
@@ -1447,7 +1458,7 @@ impl ElementRaw {
                                     subelem
                                         .0
                                         .read()
-                                        .serialize_internal(outstring, indent + 1, true, for_file);
+                                        .serialize_internal(outstring, indent + 1, true, for_file, None);
                                 }
                             }
                             ElementContent::CharacterData(chardata) => {
@@ -1464,7 +1475,17 @@ impl ElementRaw {
         } else {
             outstring.push('<');
             outstring.push_str(element_name);
-            self.serialize_attributes(outstring);
+            if let Some(file_version) = file_version && for_file.is_some() && self.element_name() == ElementName::Autosar {
+                let mut attributes = self.attributes.clone();
+                for attr in &mut attributes {
+                    if attr.attrname == AttributeName::xsiSchemalocation {
+                        attr.content = CharacterData::String(format!("http://autosar.org/schema/r4.0 {}", file_version.filename()));
+                    }
+                }
+                Self::serialize_attributes(&attributes, outstring);
+            } else {
+                Self::serialize_attributes(&self.attributes, outstring);
+            }
             outstring.push('/');
             outstring.push('>');
         }
@@ -1477,9 +1498,9 @@ impl ElementRaw {
         }
     }
 
-    fn serialize_attributes(&self, outstring: &mut String) {
-        if !self.attributes.is_empty() {
-            for attribute in &self.attributes {
+    fn serialize_attributes(attributes: &[Attribute], outstring: &mut String) {
+        if !attributes.is_empty() {
+            for attribute in attributes {
                 outstring.push(' ');
                 outstring.push_str(attribute.attrname.to_str());
                 outstring.push_str("=\"");
