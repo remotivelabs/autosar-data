@@ -158,7 +158,7 @@ impl<'a> ArxmlLexer<'a> {
         debug_assert!(endpos > self.bufpos + 1);
         debug_assert!(self.buffer[self.bufpos] == b'<');
 
-        let text = &self.buffer[self.bufpos + 2..endpos];
+        let text = &self.buffer[self.bufpos + 2..endpos].trim_ascii_end();
         self.bufpos = endpos + 1;
 
         ArxmlEvent::EndElement(text)
