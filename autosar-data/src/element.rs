@@ -1581,6 +1581,8 @@ impl Element {
     }
 
     /// Create an iterator over all sub elements of this element
+    /// 
+    /// If the element is modified while the iterator is in use, the iterator can skip sub elements or return duplicates.
     ///
     /// # Example
     ///

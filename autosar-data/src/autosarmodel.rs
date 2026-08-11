@@ -1079,6 +1079,8 @@ impl AutosarModel {
     ///
     /// Directly printing the return values could show something like this:
     ///
+    /// Note: If the model is modified while iterating, the iterator may skip elements or return duplicates.
+    ///
     /// <pre>
     /// 0: AUTOSAR
     /// 1: AR-PACKAGES
@@ -1108,6 +1110,8 @@ impl AutosarModel {
     ///
     /// The iterator returns all elements from the merged model, consisting of
     /// data from all arxml files loaded in this model.
+    ///
+    /// Note: If the model is modified while iterating, the iterator may skip elements or return duplicates.
     ///
     /// # Example
     ///
@@ -1152,6 +1156,8 @@ impl AutosarModel {
     /// Create an iterator over the list of the Autosar paths of all identifiable elements
     ///
     /// The list contains the full Autosar path of each element. It is not sorted.
+    /// 
+    /// Note: If the model is modified while iterating, the iterator may skip elements or return duplicates.
     ///
     /// # Example
     ///
