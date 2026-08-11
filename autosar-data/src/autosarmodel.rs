@@ -147,8 +147,8 @@ impl AutosarModel {
     ///
     /// # Parameters
     ///
-    ///  - `filename`: A filename for the data from the buffer. It must be unique within the model.
-    ///    It will be used by `write()`, and is also used to identify this data in error messages.
+    ///  - `filename`: The name of the file to create in the model. It must be unique within the model.
+    ///    It is not created on disk until `write()` is called.
     ///  - `version`: The [`AutosarVersion`] that will be used by the data created inside this file
     ///
     /// # Example

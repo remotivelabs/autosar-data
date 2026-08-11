@@ -1012,7 +1012,7 @@ impl<'a> ArxmlParser<'a> {
         }
     }
 
-    /// parse an arxml file and return the root element of the parsed hierarchy
+    /// parse an arxml file and return true if there is a valid arxml header, false otherwise.
     pub(crate) fn check_arxml_header(&mut self) -> bool {
         let mut lexer = ArxmlLexer::new(self.buffer, self.filename.clone());
 
