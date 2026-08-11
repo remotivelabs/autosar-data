@@ -1,5 +1,57 @@
 # Changelog
 
+## Version 0.23.0 (unreleased)
+
+### API
+
+- remove `AutosarModel::set_version`: the version is a property of the individual files in a model. `ArxmlFile::set_version` should be used instead.
+- `ElementType::get_sub_element_container_mode` and `ElementType::find_common_group` in autosar-data-specification now return an `Option`, and return `None` for invalid input instead of panicking
+
+### Fixes
+
+**Parsing**
+
+- Fix a panix on an attribute value consisting only of whitespace (e.g. `UUID="   "`)
+- Fix truncated values on unescaped `>` inside an attribute value (e.g. `<AR-PACKAGE S="a > b">`)
+- Extra spaces around the `=` in an attribute and around the closing `>` of an end tag (`</ELEMENT   >`) are now accepted
+- Duplicate attributes on an element are now detected, which is an error in strict mode and otherwise resolved by keeping the last value
+
+**Concurrency**
+
+- Fix a deadlock when passing an element to its own `remove_sub_element`, `move_element_here` or `move_element_here_at`; doing so now returns an error
+- Upward lock acquisitions in `set_reference_target`, `path()` and the cycle checks of copy/move operations no longer deadlock against concurrent downward operations
+- `serialize` and `get_references_to` no longer double-lock non-reentrantly
+- Concurrent `load_buffer` calls into an empty model are now serialized, so they can no longer both succeed while one of the two loaded element trees is silently discarded
+
+**Panics on invalid input**
+
+- Fix panics on invalid or out-of-range input, which now return an error or `None` instead: `set_relative_reference_target` and `get_reference_target` for a reference element outside any package (e.g. an SDX-REF in the AUTOSAR root's ADMIN-DATA); `ElementType::get_sub_element_version_mask`, `get_sub_element_multiplicity`, `get_sub_element_container_mode` and `find_common_group` for an out-of-range index list; and `create_sub_element` and other insertion functions for a sibling element that a non-strict load retained even though it isn't valid in the file's version
+- Fix `PartialEq`/`Ord` for elements, which violated the total ordering requirement and could panic on NaN values during `sort()`; NaN and Inf are now also rejected by the parser and by `set_character_data`, which reports the rejection as the more specific `InvalidCharacterData` instead of `IncorrectContentType`
+
+**Multi-file models**
+
+- Fix `Element::remove_from_file`, which left the model unusable when called for the root element of a single-file model; it now returns the new error `RootElementRemovalForbidden`. It also now returns `ShortNameRemovalForbidden`, instead of silently doing nothing, when asked to remove a SHORT-NAME from its only file
+- Fix `remove_file` leaving a valid parent pointer on sub elements that were removed along with the file, which could confuse code that still held a reference to one of them
+- Fix file membership of elements moved across models with `move_element_here`: they no longer hold on to weak references to files in the old model, which previously caused them to be omitted when serializing
+- Fix `AutosarModel::duplicate` for a model whose files use different Autosar versions: the copy was filtered by the oldest file version, silently dropping elements only valid in later versions and shifting file membership onto the wrong elements. Duplication is now unfiltered, and each file of the copy keeps the version of the original
+
+**Merging**
+
+- Fix data loss when merging a file: if two sub elements of a splittable element could not be merged and were kept side by side instead, every following sub element of that splittable element was silently skipped rather than merged
+- Fix the recovery from a failed merge of two sub elements of a splittable element, which could leave one element in the content of two different parents at once
+- Conflicting BSW parameters (same DEFINITION-REF, incompatible content) can no longer be merged side by side; the merge now fails instead
+- Fix duplicate REFERENCE-BASE declarations left behind when the same REFERENCE-BASE exists in several files of a split model: the merge keeps only one of the elements, and removing it previously left a stale duplicate that could still resolve references
+
+**Relative references**
+
+- Relative-reference handling was reworked so REFERENCE-BASE declarations are read live from the element tree instead of a separate cache, and relative references are indexed by their resolved absolute target path alongside absolute references. This removes the staleness bugs above at the root, and makes `get_references_to`, `check_references` and `get_reference_target` cheaper for models that use relative references
+
+### Enhancements
+
+- `check_references` now also checks relative references: it reports a reference whose BASE attribute names an out-of-scope reference base, or whose relative path does not lead to an existing element
+- Relative references now follow a renamed or moved target, the same way absolute references already did: `set_item_name` and `move_element_here`/`move_element_here_at` rewrite the relative path to keep pointing at the same element, including when the renamed/moved element is only an ancestor of the target, or is the package a REFERENCE-BASE points at. Note that the BASE attribute itself is never rewritten, so a reference cannot follow a target that is moved out of its reference base's subtree, and moving a reference to where a different base is in scope changes what it resolves to — use `check_references` to find references invalidated this way
+- Merging multi-file models is much faster: the merge used a linear search per sub element, making it quadratic. Merging a file with 8000 packages into a model previously took ~6 seconds and now takes ~6 milliseconds
+
 ## Version 0.22.0
 
 ### Features
@@ -96,7 +148,7 @@ Released 2024-10-24
 ### Api
 
 - Allow specifying a max depth for elements_dfs - Thanks @shahn
-- Add additional info the the errors `ElementInsertionConflict` and `ElementNotFound`
+- Add additional info for the errors `ElementInsertionConflict` and `ElementNotFound`
 
 ### Fixes
 
