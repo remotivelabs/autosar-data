@@ -28,3 +28,7 @@ name = "demo"
 [[bench]]
 name = "create_elements"
 harness = false
+
+[[bench]]
+name = "load_file"
+harness = false
