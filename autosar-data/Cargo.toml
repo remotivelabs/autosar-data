@@ -26,6 +26,10 @@ criterion = { version = "0.8", features = ["html_reports"]}
 name = "demo"
 
 [[bench]]
+name = "build_model"
+harness = false
+
+[[bench]]
 name = "create_elements"
 harness = false
 
