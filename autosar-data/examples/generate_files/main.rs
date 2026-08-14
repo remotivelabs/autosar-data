@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use autosar_data::*;
-use autosar_data_specification::CharacterDataSpec;
+use autosar_data_specification::{CharacterDataSpec, ElementType};
 
 static VERSIONS: [AutosarVersion; 22] = [
     AutosarVersion::Autosar_4_0_1,
@@ -72,6 +72,9 @@ fn create_sub_elements(
         ..
     } in elem.list_valid_sub_elements()
     {
+        if !can_create_value(&elem.element_type(), se_name, version) {
+            continue;
+        }
         if completed.get(&(elem_name, se_name)).is_none() {
             match create_sub_element_helper(elem, se_name, is_named, counter) {
                 Ok(sub_elem) => {
@@ -124,10 +127,24 @@ fn create_sub_element_helper(
     }
 }
 
+/// Check if the sub element `se_name` of `elem_type` could be filled with valid character data
+fn can_create_value(elem_type: &ElementType, se_name: ElementName, version: AutosarVersion) -> bool {
+    let Some((se_type, _)) = elem_type.find_sub_element(se_name, version as u32) else {
+        // the sub element doesn't exist in this version; creating it will fail on its own
+        return true;
+    };
+    match se_type.chardata_spec() {
+        Some(spec) => make_cdata(spec, version).is_some(),
+        None => true,
+    }
+}
+
 fn create_value(elem: &Element, version: AutosarVersion) {
     if elem.content_type() == ContentType::CharacterData {
         let spec = elem.element_type().chardata_spec().unwrap();
-        let cdata = make_cdata(spec, version);
+        // can_create_value() has already excluded elements without any valid value
+        let cdata = make_cdata(spec, version)
+            .unwrap_or_else(|| panic!("found no valid value for {} in version {version}", elem.element_name()));
         elem.set_character_data(cdata.clone())
             .unwrap_or_else(|err| panic!("error {err} while setting {cdata} with spec {spec:?}",));
     } else if elem.content_type() == ContentType::Mixed {
@@ -137,19 +154,17 @@ fn create_value(elem: &Element, version: AutosarVersion) {
 
 fn create_attributes(elem: &Element, version: AutosarVersion) {
     for (attr_name, spec, required) in elem.element_type().attribute_spec_iter() {
-        if required {
-            let _ = elem.set_attribute(attr_name, make_cdata(spec, version));
+        if required && let Some(cdata) = make_cdata(spec, version) {
+            let _ = elem.set_attribute(attr_name, cdata);
         }
     }
 }
 
-fn make_cdata(spec: &CharacterDataSpec, version: AutosarVersion) -> CharacterData {
-    match spec {
+fn make_cdata(spec: &CharacterDataSpec, version: AutosarVersion) -> Option<CharacterData> {
+    let cdata = match spec {
         autosar_data_specification::CharacterDataSpec::Enum { items } => {
-            let valid_item = items
-                .iter()
-                .find(|(_, ver_mask)| version.compatible(*ver_mask))
-                .unwrap_or_else(|| panic!("found no valid enum value from {items:?} in version {version}"));
+            // this is fallible solely to handle the enum APMC-ELEMENT-CREATION-ENUM, which is broken in R24-11
+            let valid_item = items.iter().find(|(_, ver_mask)| version.compatible(*ver_mask))?;
             CharacterData::Enum(valid_item.0)
         }
         autosar_data_specification::CharacterDataSpec::Pattern { regex, .. } => match *regex {
@@ -206,5 +221,6 @@ fn make_cdata(spec: &CharacterDataSpec, version: AutosarVersion) -> CharacterDat
         }
         autosar_data_specification::CharacterDataSpec::UnsignedInteger => CharacterData::UnsignedInteger(42),
         autosar_data_specification::CharacterDataSpec::Float => CharacterData::Float(std::f64::consts::PI),
-    }
+    };
+    Some(cdata)
 }
