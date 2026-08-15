@@ -1,6 +1,6 @@
 [package]
 name = "autosar-data-specification"
-version = "0.21.0"
+version = "0.23.0"
 authors = ["Daniel Thaler <daniel@dthaler.de>"]
 edition = "2024"
 description = "specification of the Autosar arxml file format as rust data structures"
@@ -14,3 +14,12 @@ docstrings = []
 
 [dependencies]
 num-traits = "0.2.16"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+# only used by the regex benchmark, as an independent implementation of the patterns in regex.rs
+regex = "1.11"
+
+[[bench]]
+name = "regex"
+harness = false

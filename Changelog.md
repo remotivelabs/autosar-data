@@ -1,6 +1,6 @@
 # Changelog
 
-## Version 0.23.0 (unreleased)
+## Version 0.23.0
 
 ### API
 
@@ -15,6 +15,7 @@
 - Fix truncated values on unescaped `>` inside an attribute value (e.g. `<AR-PACKAGE S="a > b">`)
 - Extra spaces around the `=` in an attribute and around the closing `>` of an end tag (`</ELEMENT   >`) are now accepted
 - Duplicate attributes on an element are now detected, which is an error in strict mode and otherwise resolved by keeping the last value
+- An empty SHORT-NAME (`<SHORT-NAME></SHORT-NAME>`, or one containing only whitespace or a comment) is now rejected with the new error `ArxmlParserError::EmptyShortName`.
 
 **Concurrency**
 
@@ -31,7 +32,7 @@
 **Multi-file models**
 
 - Fix `Element::remove_from_file`, which left the model unusable when called for the root element of a single-file model; it now returns the new error `RootElementRemovalForbidden`. It also now returns `ShortNameRemovalForbidden`, instead of silently doing nothing, when asked to remove a SHORT-NAME from its only file
-- Fix `remove_file` leaving a valid parent pointer on sub elements that were removed along with the file, which could confuse code that still held a reference to one of them
+- Fix `remove_file` leaving a valid parent pointer on sub elements that were removed along with the file, which could confuse code that still held a reference to one of them.
 - Fix file membership of elements moved across models with `move_element_here`: they no longer hold on to weak references to files in the old model, which previously caused them to be omitted when serializing
 - Fix `AutosarModel::duplicate` for a model whose files use different Autosar versions: the copy was filtered by the oldest file version, silently dropping elements only valid in later versions and shifting file membership onto the wrong elements. Duplication is now unfiltered, and each file of the copy keeps the version of the original
 
@@ -51,6 +52,9 @@
 - `check_references` now also checks relative references: it reports a reference whose BASE attribute names an out-of-scope reference base, or whose relative path does not lead to an existing element
 - Relative references now follow a renamed or moved target, the same way absolute references already did: `set_item_name` and `move_element_here`/`move_element_here_at` rewrite the relative path to keep pointing at the same element, including when the renamed/moved element is only an ancestor of the target, or is the package a REFERENCE-BASE points at. Note that the BASE attribute itself is never rewritten, so a reference cannot follow a target that is moved out of its reference base's subtree, and moving a reference to where a different base is in scope changes what it resolves to — use `check_references` to find references invalidated this way
 - Merging multi-file models is much faster: the merge used a linear search per sub element, making it quadratic. Merging a file with 8000 packages into a model previously took ~6 seconds and now takes ~6 milliseconds
+- Building a model element by element is about twice as fast. Benchmarking showed that most of the overhead is in locking, so now each element caches a reference to the model, avoiding many upward traversals though the model and taking much fewer locks per operation.
+- A loaded model needs ~10% less memory.
+- Regex validation of character data now uses hand-written code rather than generated DFA state tables, eliminating 54kB of static data in linked binaries. The hand written code is also faster in micro-benchmarks, but this doesn't show up in real world usage.
 
 ## Version 0.22.0
 
