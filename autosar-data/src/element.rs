@@ -2083,7 +2083,7 @@ impl Element {
 
         // check the compatibility of all sub-elements
         for sub_element in self.sub_elements() {
-            if (sub_element.0.read().file_membership.is_empty() || sub_element.0.read().file_membership.contains(file))
+            if sub_element.0.read().is_in_file(file)
                 && let Some((_, indices)) = elemtype_new
                     .find_sub_element(sub_element.element_name(), target_version as u32)
                     .or(elemtype_new.find_sub_element(sub_element.element_name(), u32::MAX))
@@ -2182,8 +2182,8 @@ impl Element {
                 .0
                 .try_read_for(LOCK_CONTENTION_TIMEOUT)
                 .ok_or(AutosarDataError::ParentElementLocked)?;
-            if !locked_cur_elem.file_membership.is_empty() {
-                return Ok((cur_elem == self, locked_cur_elem.file_membership.clone()));
+            if let Some(files) = locked_cur_elem.file_membership.as_deref() {
+                return Ok((cur_elem == self, files.clone()));
             }
             let parent = locked_cur_elem.parent()?;
             drop(locked_cur_elem);
@@ -2197,7 +2197,7 @@ impl Element {
 
     /// return the file membership of this element without trying to get an inherited value
     pub(crate) fn file_membership_local(&self) -> HashSet<WeakArxmlFile> {
-        self.0.read().file_membership.clone()
+        self.0.read().file_membership_cloned()
     }
 
     /// set the file membership of an element
@@ -2217,7 +2217,7 @@ impl Element {
             .map_or(u32::MAX, |p| p.element_type().splittable());
         // can always reset the membership to empty = inherited; otherwise the parent must be splittable
         if file_membership.is_empty() || parent_splittable != 0 {
-            self.0.write().file_membership = file_membership;
+            self.0.write().set_file_membership(file_membership);
         }
     }
 
@@ -2255,7 +2255,7 @@ impl Element {
                 if !current_fileset.contains(&weak_file) {
                     let mut updated_fileset = current_fileset;
                     updated_fileset.insert(weak_file);
-                    self.0.write().file_membership = updated_fileset;
+                    self.0.write().set_file_membership(updated_fileset);
 
                     // recursively continue with the parent
                     if let Some(parent) = self.parent()? {
@@ -2284,9 +2284,9 @@ impl Element {
             if self.element_type().splittable() != 0 {
                 for se in self.sub_elements() {
                     if let Some(mut subelem) = se.0.try_write_for(LOCK_CONTENTION_TIMEOUT)
-                        && subelem.file_membership.is_empty()
+                        && subelem.file_membership.is_none()
                     {
-                        subelem.file_membership.clone_from(&current_fileset);
+                        subelem.set_file_membership(current_fileset.clone());
                     }
                 }
             }
@@ -2296,7 +2296,7 @@ impl Element {
             // if the parent is splittable, or if the current element already has a fileset, then that fileset should be updated
             let parent_splittable = self.parent()?.is_none_or(|p| p.element_type().splittable() != 0);
             if parent_splittable || local {
-                self.0.write().file_membership = extended_fileset;
+                self.0.write().set_file_membership(extended_fileset);
             }
 
             // recursively continue with the parent
@@ -2356,16 +2356,17 @@ impl Element {
                     };
                     parent.remove_sub_element(self.to_owned())
                 } else {
-                    self.0.write().file_membership = restricted_fileset;
+                    self.0.write().set_file_membership(restricted_fileset);
 
                     // update all sub elements with non-default file_membership
                     let mut to_delete = Vec::new();
                     for (_, subelem) in self.elements_dfs() {
                         // only need to care about those where file_membership is not empty. All other inherit from their parent
-                        if !subelem.0.read().file_membership.is_empty() {
-                            subelem.0.write().file_membership.remove(&weak_file);
-                            // if the file_membership just went to empty, then subelem should be deleted
-                            if subelem.0.read().file_membership.is_empty() {
+                        if subelem.0.read().file_membership.is_some() {
+                            subelem.0.write().remove_file_membership(&weak_file);
+                            // removing the last file resets the membership to inherited, which means
+                            // that subelem is no longer in any file and has to be deleted
+                            if subelem.0.read().file_membership.is_none() {
                                 to_delete.push(subelem);
                             }
                         }
@@ -2537,9 +2538,8 @@ impl Element {
                 .0
                 .try_read_for(LOCK_CONTENTION_TIMEOUT)
                 .ok_or(AutosarDataError::ParentElementLocked)?;
-            if !locked_cur_elem.file_membership.is_empty() {
-                let ver = locked_cur_elem
-                    .file_membership
+            if let Some(files) = locked_cur_elem.file_membership.as_deref() {
+                let ver = files
                     .iter()
                     .filter_map(WeakArxmlFile::upgrade)
                     .map(|f| f.version())
@@ -2742,7 +2742,7 @@ impl std::fmt::Debug for Element {
         // only print the file membership if the element is splittable
         // elements that are not splittable may not modify their file membership
         if elem.elemtype.splittable() != 0 {
-            if elem.file_membership.is_empty() {
+            if elem.file_membership.is_none() {
                 dbgstruct.field("file_membership", &DebugDisplay("(inherited)"));
             } else {
                 dbgstruct.field("file_membership", &elem.file_membership);

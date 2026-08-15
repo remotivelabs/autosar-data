@@ -320,7 +320,7 @@ mod test {
             elemtype: ElementType::ROOT,      // doesn't matter for this test
             attributes: SmallVec::new(),
             content: SmallVec::new(),
-            file_membership: HashSet::with_capacity(0),
+            file_membership: None,
             comment: None,
         }
         .wrap();
@@ -333,7 +333,7 @@ mod test {
                 ElementContent::Element(sub_sub_element.clone()),
                 ElementContent::Element(sub_sub_element.clone())
             ],
-            file_membership: HashSet::with_capacity(0),
+            file_membership: None,
             comment: None,
         }
         .wrap();
@@ -346,7 +346,7 @@ mod test {
                 ElementContent::Element(sub_element.clone()),
                 ElementContent::Element(sub_element.clone())
             ],
-            file_membership: HashSet::with_capacity(0),
+            file_membership: None,
             comment: None,
         }
         .wrap();

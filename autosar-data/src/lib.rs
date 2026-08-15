@@ -432,7 +432,21 @@ pub(crate) struct ElementRaw {
     pub(crate) elemtype: ElementType,
     pub(crate) content: SmallVec<[ElementContent; 4]>,
     pub(crate) attributes: SmallVec<[Attribute; 1]>,
-    pub(crate) file_membership: HashSet<WeakArxmlFile>,
+    /// the files that this element is a member of, or `None` if it inherits the membership of its
+    /// parent element
+    ///
+    /// Only elements of a model that is split across several files ever restrict their membership,
+    /// so this is `None` in nearly every element. The set is boxed because a `HashSet` is 48 bytes
+    /// and `ElementRaw` exists once per element: keeping the set out of line saves 40 bytes each,
+    /// which is ~10% of the memory of a loaded model.
+    ///
+    /// An empty set means the same as `None`, so it is never stored: `is_none()` is the check for
+    /// "this element inherits its file membership". `set_file_membership` maintains this.
+    // clippy::box_collection argues that the contents of a HashSet are on the heap already, so the
+    // Box only adds an allocation. That is true, but it is not what this Box is for: the 48 byte
+    // control block of the HashSet is stored inline, and moving it out of line is the whole point.
+    #[allow(clippy::box_collection)]
+    pub(crate) file_membership: Option<Box<HashSet<WeakArxmlFile>>>,
     pub(crate) comment: Option<String>,
 }
 

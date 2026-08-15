@@ -73,6 +73,49 @@ impl ElementRaw {
         self.parent.weak_model()
     }
 
+    /// true if this element appears in the given file
+    ///
+    /// An element that does not restrict its file membership inherits the membership of its parent,
+    /// so it appears in the file whenever its parent does.
+    pub(crate) fn is_in_file(&self, file: &WeakArxmlFile) -> bool {
+        self.file_membership.as_ref().is_none_or(|files| files.contains(file))
+    }
+
+    /// a copy of the file membership stored on this element, which is empty if it has none
+    pub(crate) fn file_membership_cloned(&self) -> HashSet<WeakArxmlFile> {
+        self.file_membership.as_deref().cloned().unwrap_or_default()
+    }
+
+    /// replace the file membership stored on this element
+    ///
+    /// An empty set is stored as `None`, since both mean that the element inherits the membership
+    /// of its parent.
+    pub(crate) fn set_file_membership(&mut self, files: HashSet<WeakArxmlFile>) {
+        self.file_membership = (!files.is_empty()).then(|| Box::new(files));
+    }
+
+    /// add a file to the membership of this element, which starts to restrict its membership if it
+    /// did not do so before
+    ///
+    /// Returns true if the file was not in the set yet.
+    pub(crate) fn insert_file_membership(&mut self, file: WeakArxmlFile) -> bool {
+        self.file_membership.get_or_insert_default().insert(file)
+    }
+
+    /// remove a file from the membership of this element, if it restricts its membership at all
+    ///
+    /// An element that ends up in no file at all reverts to `None`, i.e. it inherits the membership
+    /// of its parent again. Callers that must delete such an element check for this themselves,
+    /// before the removal, by testing whether the element restricts its membership.
+    pub(crate) fn remove_file_membership(&mut self, file: &WeakArxmlFile) {
+        if let Some(files) = &mut self.file_membership {
+            files.remove(file);
+            if files.is_empty() {
+                self.file_membership = None;
+            }
+        }
+    }
+
     /// get the [`ElementName`] of the element
     pub(crate) fn element_name(&self) -> ElementName {
         self.elemname
@@ -310,7 +353,7 @@ impl ElementRaw {
                 elemtype,
                 content: smallvec![],
                 attributes: smallvec![],
-                file_membership: HashSet::with_capacity(0),
+                file_membership: None,
                 comment: None,
             }
             .wrap();
@@ -409,7 +452,7 @@ impl ElementRaw {
                 elemtype,
                 content: smallvec![],
                 attributes: smallvec![],
-                file_membership: HashSet::with_capacity(0),
+                file_membership: None,
                 comment: None,
             }
             .wrap();
@@ -567,7 +610,7 @@ impl ElementRaw {
             content: SmallVec::with_capacity(self.content.len()),
             attributes: SmallVec::with_capacity(self.attributes.len()),
             parent: ElementOrModel::None,
-            file_membership: HashSet::with_capacity(0),
+            file_membership: None,
             comment: self.comment.clone(),
         }
         .wrap();
@@ -887,7 +930,7 @@ impl ElementRaw {
         // moved element shares any files with its new parent, so the parent might be skipped for all files that
         // the moved element would be written to, causing it to be lost.
         for (_, elem) in move_element.elements_dfs() {
-            elem.0.write().file_membership.clear();
+            elem.0.write().file_membership = None;
         }
 
         // insert move_element
@@ -1006,7 +1049,7 @@ impl ElementRaw {
 
         // reset the file membership of the moved element and all its sub elements to None, since they are now part of a different model
         for (_, elem) in move_element.elements_dfs() {
-            elem.0.write().file_membership.clear();
+            elem.0.write().file_membership = None;
         }
 
         // insert move_element
@@ -1440,8 +1483,7 @@ impl ElementRaw {
                     for item in &self.content {
                         if let ElementContent::Element(subelem) = item
                             && (for_file.is_none()
-                                || subelem.0.read().file_membership.is_empty()
-                                || subelem.0.read().file_membership.contains(for_file.as_ref().unwrap()))
+                                || subelem.0.read().is_in_file(for_file.as_ref().unwrap()))
                         {
                             subelem
                                 .0
@@ -1471,8 +1513,7 @@ impl ElementRaw {
                         match item {
                             ElementContent::Element(subelem) => {
                                 if for_file.is_none()
-                                    || subelem.0.read().file_membership.is_empty()
-                                    || subelem.0.read().file_membership.contains(for_file.as_ref().unwrap())
+                                    || subelem.0.read().is_in_file(for_file.as_ref().unwrap())
                                 {
                                     subelem
                                         .0

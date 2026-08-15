@@ -123,7 +123,7 @@ impl AutosarModel {
             elemtype: ElementType::ROOT,
             content: SmallVec::new(),
             attributes: root_attributes,
-            file_membership: HashSet::with_capacity(0),
+            file_membership: None,
             comment: None,
         }
         .wrap();
@@ -269,7 +269,7 @@ impl AutosarModel {
 
         if locked_file_list.is_empty() {
             root_element.set_parent(ElementOrModel::Model(self.downgrade()));
-            root_element.0.write().file_membership.insert(arxml_file.downgrade());
+            root_element.0.write().insert_file_membership(arxml_file.downgrade());
             self.0.write().root_element = root_element;
         } else {
             let result = self.merge_file_data(&root_element, arxml_file.downgrade(), &locked_file_list);
@@ -365,7 +365,7 @@ impl AutosarModel {
             }
         })?;
 
-        self.root_element().0.write().file_membership.insert(new_file);
+        self.root_element().0.write().insert_file_membership(new_file);
 
         Ok(())
     }
@@ -477,9 +477,9 @@ impl AutosarModel {
             // files contains the permisions of the parent
             let restricted = {
                 let mut elem_locked = element.0.write();
-                let restricted = elem_locked.file_membership.is_empty();
+                let restricted = elem_locked.file_membership.is_none();
                 if restricted {
-                    files.clone_into(&mut elem_locked.file_membership);
+                    elem_locked.set_file_membership(files.clone());
                 }
                 restricted
             };
@@ -643,8 +643,8 @@ impl AutosarModel {
                 ElementOrModel::Element(parent_a.downgrade(), parent_a_locked.weak_model()),
             );
             // restrict new_element, it is only present in new_file
-            let old_file_membership = new_elem_locked.file_membership.clone();
-            new_elem_locked.file_membership.insert(new_file.clone());
+            let old_file_membership = new_elem_locked.file_membership_cloned();
+            new_elem_locked.insert_file_membership(new_file.clone());
             (old_parent, old_file_membership)
         };
         undo.push(MergeUndo::Imported {
@@ -686,16 +686,16 @@ impl AutosarModel {
                     // parent reference must point there again
                     let mut elem_locked = element.0.write();
                     elem_locked.set_parent(old_parent);
-                    elem_locked.file_membership = old_file_membership;
+                    elem_locked.set_file_membership(old_file_membership);
                 }
                 MergeUndo::FileMembership {
                     element,
                     old_file_membership,
                 } => {
-                    element.0.write().file_membership = old_file_membership;
+                    element.0.write().set_file_membership(old_file_membership);
                 }
                 MergeUndo::FileMembershipExtended { element, file } => {
-                    element.0.write().file_membership.remove(&file);
+                    element.0.write().remove_file_membership(&file);
                 }
             }
         }
@@ -711,10 +711,9 @@ impl AutosarModel {
     ) -> Result<(), AutosarDataError> {
         for (elem_a, elem_b) in elements_merge {
             // get the list of files that the element from a is present in
-            let files = if !elem_a.0.read().file_membership.is_empty() {
-                elem_a.0.read().file_membership.clone()
-            } else {
-                files.clone()
+            let files = match elem_a.0.read().file_membership.as_deref() {
+                Some(elem_files) => elem_files.clone(),
+                None => files.clone(),
             };
 
             // merge the two elements; remember where the actions of this merge start in the
@@ -725,8 +724,8 @@ impl AutosarModel {
                 Ok(()) => {
                     // update the file membership of the merged element, if there was any
                     let mut elem_a_locked = elem_a.0.write();
-                    if !elem_a_locked.file_membership.is_empty()
-                        && elem_a_locked.file_membership.insert(new_file.clone())
+                    if elem_a_locked.file_membership.is_some()
+                        && elem_a_locked.insert_file_membership(new_file.clone())
                     {
                         drop(elem_a_locked);
                         undo.push(MergeUndo::FileMembershipExtended {
@@ -754,7 +753,7 @@ impl AutosarModel {
                             // elem_b, otherwise they would be part of both elements at once
                             Self::rollback_merge(undo, undo_mark);
 
-                            let old_file_membership = elem_a.0.read().file_membership.clone();
+                            let old_file_membership = elem_a.0.read().file_membership_cloned();
                             elem_a.set_file_membership(files);
                             undo.push(MergeUndo::FileMembership {
                                 element: elem_a.clone(),
@@ -1061,11 +1060,12 @@ impl AutosarModel {
             // from one file to another.
             debug_assert_eq!(orig_elem.element_name(), copy_elem.element_name());
             let mut locked_copy = copy_elem.0.try_write().ok_or(AutosarDataError::ParentElementLocked)?;
-            locked_copy.file_membership.clear();
+            locked_copy.file_membership = None;
 
-            for orig_file in orig_elem.0.read().file_membership.iter().filter_map(|w| w.upgrade()) {
+            let orig_files = orig_elem.0.read().file_membership_cloned();
+            for orig_file in orig_files.iter().filter_map(WeakArxmlFile::upgrade) {
                 if let Some(copy_file) = filemap.get(&orig_file.filename()) {
-                    locked_copy.file_membership.insert(copy_file.clone());
+                    locked_copy.insert_file_membership(copy_file.clone());
                 }
             }
         }
@@ -1615,16 +1615,26 @@ impl std::fmt::Debug for WeakAutosarModel {
 /// missing from the cache.
 #[cfg(test)]
 impl AutosarModel {
-    /// Check that every element of this model knows which model it belongs to
+    /// Check the per-element invariants that every mutating operation has to maintain
     ///
-    /// Each element caches the model next to its parent reference, so every operation that attaches
-    /// a subtree to a model, or moves one from another model, has to update the whole subtree.
-    fn verify_model_links(&self) -> Result<(), String> {
+    /// Each element caches the model it belongs to next to its parent reference, so every operation
+    /// that attaches a subtree to a model, or moves one from another model, has to update the whole
+    /// subtree. An element also may not store an empty file membership, which is expressed as
+    /// `None` instead.
+    fn verify_element_invariants(&self) -> Result<(), String> {
         for (_, element) in self.root_element().elements_dfs() {
             match element.model() {
                 Ok(model) if model == *self => {}
                 Ok(_) => return Err(format!("element {} points at a different model", element.xml_path())),
                 Err(error) => return Err(format!("element {} has no model: {error}", element.xml_path())),
+            }
+            // an element that is in no file at all is meaningless: an empty set has to be stored as
+            // None, otherwise the is_none() check for "inherits its file membership" is wrong
+            if element.0.read().file_membership.as_deref().is_some_and(HashSet::is_empty) {
+                return Err(format!(
+                    "element {} stores an empty file membership instead of None",
+                    element.xml_path()
+                ));
             }
         }
         Ok(())
@@ -1639,9 +1649,9 @@ impl AutosarModel {
     // affect them.
     #[allow(clippy::mutable_key_type)]
     pub(crate) fn verify_reference_caches(&self) -> Result<(), String> {
-        // not a cache of the model, but subject to the same rule that every mutating operation has
-        // to keep it consistent, and checked here so that it is covered by the same tests
-        self.verify_model_links()?;
+        // not caches of the model, but subject to the same rule that every mutating operation has
+        // to keep them consistent, and checked here so that they are covered by the same tests
+        self.verify_element_invariants()?;
 
         let mut tree_elements = std::collections::HashSet::new();
         // (character data, element) of each reference without a BASE attribute

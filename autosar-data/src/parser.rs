@@ -4,7 +4,6 @@ use autosar_data_specification::{
 };
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::str::Utf8Error;
@@ -356,7 +355,7 @@ impl<'a> ArxmlParser<'a> {
                 elemtype: ElementType::ROOT,
                 content: SmallVec::new(),
                 attributes,
-                file_membership: HashSet::with_capacity(0),
+                file_membership: None,
                 comment: stored_comment,
             };
             let path = Cow::from("");
@@ -491,7 +490,7 @@ impl<'a> ArxmlParser<'a> {
                             elemtype: sub_elemtype,
                             content: SmallVec::new(),
                             attributes: self.parse_attribute_text(sub_elemtype, attr_text)?,
-                            file_membership: HashSet::with_capacity(0),
+                            file_membership: None,
                             comment: stored_comment,
                         };
                         let sub_element = self.parse_element(new_element, Cow::from(path.as_ref()), lexer)?;
