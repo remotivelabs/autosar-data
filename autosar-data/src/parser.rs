@@ -10,6 +10,7 @@ use std::str::FromStr;
 use std::str::Utf8Error;
 use thiserror::Error;
 
+use crate::WeakAutosarModel;
 use crate::lexer::{ArxmlEvent, ArxmlLexer};
 use crate::{
     Attribute, AutosarDataError, CharacterData, Element, ElementContent, ElementOrModel, ElementRaw, WeakElement,
@@ -268,6 +269,7 @@ pub(crate) struct ArxmlParser<'a> {
     pub(crate) references: Vec<(String, WeakElement, Option<String>)>,
     pub(crate) warnings: Vec<AutosarDataError>,
     standalone: Option<bool>,
+    pub(crate) model: WeakAutosarModel,
 }
 
 impl<'a> ArxmlParser<'a> {
@@ -280,6 +282,7 @@ impl<'a> ArxmlParser<'a> {
             current_element: ElementName::Autosar,
             strict,
             version_compatibility: u32::MAX,
+            model: WeakAutosarModel::default(),
             identifiables: Vec::new(),
             references: Vec::new(),
             warnings: Vec::new(),
@@ -483,7 +486,7 @@ impl<'a> ArxmlParser<'a> {
 
                         // recursively parse the sub element and its sub sub elements
                         let new_element = ElementRaw {
-                            parent: ElementOrModel::Element(wrapped_element.downgrade()),
+                            parent: ElementOrModel::Element(wrapped_element.downgrade(), self.model.clone()),
                             elemname: name,
                             elemtype: sub_elemtype,
                             content: SmallVec::new(),

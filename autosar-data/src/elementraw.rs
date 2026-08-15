@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::{
     Attribute, AutosarDataError, AutosarModel, CharacterData, ContentType, Element, ElementContent, ElementOrModel,
-    ElementRaw, WeakArxmlFile, WeakElement,
+    ElementRaw, WeakArxmlFile, WeakAutosarModel, WeakElement,
     autosarmodel::{PathRemap, replace_path_prefix},
 };
 
@@ -46,7 +46,7 @@ impl ElementRaw {
     /// get the parent element of the current element
     pub(crate) fn parent(&self) -> Result<Option<Element>, AutosarDataError> {
         match &self.parent {
-            ElementOrModel::Element(parent) => {
+            ElementOrModel::Element(parent, _) => {
                 // for items that should have a parent, getting it is not allowed to return None
                 let parent = parent.upgrade().ok_or(AutosarDataError::ItemDeleted)?;
                 Ok(Some(parent))
@@ -58,6 +58,19 @@ impl ElementRaw {
 
     pub(crate) fn set_parent(&mut self, new_parent: ElementOrModel) {
         self.parent = new_parent;
+    }
+
+    /// get the model that this element belongs to
+    ///
+    /// Fails with `ItemDeleted` if the element has been removed from the model, or if the model
+    /// itself no longer exists.
+    pub(crate) fn model(&self) -> Result<AutosarModel, AutosarDataError> {
+        self.parent.model().ok_or(AutosarDataError::ItemDeleted)
+    }
+
+    /// a weak reference to the model of this element, for use in the parent reference of a new sub element
+    pub(crate) fn weak_model(&self) -> WeakAutosarModel {
+        self.parent.weak_model()
     }
 
     /// get the [`ElementName`] of the element
@@ -205,7 +218,7 @@ impl ElementRaw {
                     }
                     // try to get the parent of the current element
                     match &locked_cur_elem.parent {
-                        ElementOrModel::Element(weak_parent) => {
+                        ElementOrModel::Element(weak_parent, _) => {
                             if let Some(parent) = weak_parent.upgrade() {
                                 cur_elem_opt = Some(parent);
                             } else {
@@ -292,7 +305,7 @@ impl ElementRaw {
             Err(AutosarDataError::ItemNameRequired { element: element_name })
         } else {
             let sub_element = ElementRaw {
-                parent: ElementOrModel::Element(self_weak),
+                parent: ElementOrModel::Element(self_weak, self.weak_model()),
                 elemname: element_name,
                 elemtype,
                 content: smallvec![],
@@ -391,7 +404,7 @@ impl ElementRaw {
 
             // create the new element
             let sub_element = ElementRaw {
-                parent: ElementOrModel::Element(self_weak),
+                parent: ElementOrModel::Element(self_weak, self.weak_model()),
                 elemname: element_name,
                 elemtype,
                 content: smallvec![],
@@ -487,7 +500,7 @@ impl ElementRaw {
         // check if self (target of the move) is a sub element of new_element
         // if it is, then the move is not allowed
         let mut wrapped_parent = self.parent.clone();
-        while let ElementOrModel::Element(weak_parent) = wrapped_parent {
+        while let ElementOrModel::Element(weak_parent, _) = wrapped_parent {
             let parent = weak_parent.upgrade().ok_or(AutosarDataError::ItemDeleted)?;
             if parent == *other {
                 return Err(AutosarDataError::ForbiddenCopyOfParent);
@@ -507,7 +520,10 @@ impl ElementRaw {
         let path = self.path_unchecked()?;
 
         // set the parent of the newelem - the methods path(), containing_file(), etc become available on newelem
-        newelem.set_parent(ElementOrModel::Element(self_weak));
+        newelem.set_parent(ElementOrModel::Element(self_weak, model.downgrade()));
+        // deep_copy() builds the copy without a model, so the whole copied subtree learns about
+        // the model only now, when it is attached
+        newelem.set_model_recursive(&model.downgrade());
         if newelem.is_identifiable() {
             newelem.0.read().make_unique_item_name(model, &path)?;
         }
@@ -604,7 +620,8 @@ impl ElementRaw {
                                 .is_some()
                         });
                         if compatible && let Ok(copied_sub_elem) = sub_elem.0.read().deep_copy(target_version) {
-                            copied_sub_elem.0.write().parent = ElementOrModel::Element(copy_wrapped.downgrade());
+                            copied_sub_elem.0.write().parent =
+                                ElementOrModel::Element(copy_wrapped.downgrade(), WeakAutosarModel::default());
                             copy.content.push(ElementContent::Element(copied_sub_elem));
                         }
                     }
@@ -770,7 +787,7 @@ impl ElementRaw {
         // check if self (target of the move) is a sub element of new_element
         // if it is, then the move is not allowed
         let mut wrapped_parent = self.parent.clone();
-        while let ElementOrModel::Element(weak_parent) = wrapped_parent {
+        while let ElementOrModel::Element(weak_parent, _) = wrapped_parent {
             let parent = weak_parent.upgrade().ok_or(AutosarDataError::ItemDeleted)?;
             if parent == *move_element {
                 return Err(AutosarDataError::ForbiddenMoveToSubElement);
@@ -833,7 +850,7 @@ impl ElementRaw {
 
         // set the parent of the new element to the current element
         let mut move_element_locked = move_element.0.write();
-        move_element_locked.parent = ElementOrModel::Element(self_weak);
+        move_element_locked.parent = ElementOrModel::Element(self_weak, model.downgrade());
         let dest_path = if move_element_locked.is_identifiable() {
             let new_name = move_element_locked.make_unique_item_name(model, &dest_path_prefix)?;
             format!("{dest_path_prefix}/{new_name}")
@@ -949,7 +966,7 @@ impl ElementRaw {
 
         // set the parent of the new element to the current element
         let mut move_element_locked = move_element.0.write();
-        move_element_locked.parent = ElementOrModel::Element(self_weak);
+        move_element_locked.parent = ElementOrModel::Element(self_weak, model.downgrade());
         let dest_path = if move_element_locked.is_identifiable() {
             let new_name = move_element_locked.make_unique_item_name(model, &dest_path_prefix)?;
             format!("{dest_path_prefix}/{new_name}")
@@ -957,6 +974,8 @@ impl ElementRaw {
             dest_path_prefix
         };
         drop(move_element_locked);
+        // the sub elements of move_element still point at the model they were moved out of
+        move_element.set_model_recursive(&model.downgrade());
 
         // cache references to all the identifiable elements in move_element
         for (orig_path, identifiable_element) in &original_paths {

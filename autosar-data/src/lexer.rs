@@ -1,4 +1,5 @@
 use super::AutosarDataError;
+use memchr::memchr;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -276,9 +277,7 @@ impl ArxmlLexer<'_> {
                 } else if self.buffer[self.bufpos] == b'<' {
                     // start of an <element> or </element> or <!--comment-->
                     // find a '>' character
-                    let findpos = self.buffer[self.bufpos + 1..]
-                        .iter()
-                        .position(|c| *c == b'>')
+                    let findpos = memchr(b'>', &self.buffer[self.bufpos + 1..])
                         .ok_or_else(|| self.error(ArxmlLexerError::IncompleteData))?;
                     // endpos may be the position of a '>' that is part of an attribute value, but the
                     // call to read_element_start() will check for that and continue the search if necessary.

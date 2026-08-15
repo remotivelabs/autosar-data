@@ -77,6 +77,30 @@ impl Element {
         self.0.write().set_parent(new_parent);
     }
 
+    /// point this element and all of its sub elements at the given model
+    ///
+    /// Every element caches the model it belongs to next to its parent reference, so a subtree that
+    /// was built outside of a model, by `deep_copy` or in a different model or by a move between
+    /// models, has to be updated when it is attached. The element itself already has the right
+    /// parent reference at this point, so setting it again is harmless.
+    pub(crate) fn set_model_recursive(&self, model: &WeakAutosarModel) {
+        for (_, element) in self.elements_dfs() {
+            if let ElementOrModel::Element(_, element_model) = &mut element.0.write().parent {
+                *element_model = model.clone();
+            }
+        }
+    }
+
+    /// detach this element and all of its sub elements from their model
+    ///
+    /// The elements keep their content, so handles to any of them remain usable, but they no
+    /// longer have a parent or a model.
+    pub(crate) fn detach_recursive(&self) {
+        for (_, element) in self.elements_dfs() {
+            element.0.write().parent = ElementOrModel::None;
+        }
+    }
+
     /// Get the [`ElementName`] of the element
     ///
     /// # Example
@@ -175,8 +199,7 @@ impl Element {
                 element: self.element_name(),
             });
         }
-        let model = self.model()?;
-        let version = self.min_version()?;
+        let (model, version) = self.model_and_version()?;
         self.0.write().set_item_name(new_name, &model, version)
     }
 
@@ -288,7 +311,7 @@ impl Element {
                     .try_read_for(LOCK_CONTENTION_TIMEOUT)
                     .ok_or(AutosarDataError::ParentElementLocked)?;
                 match &element.parent {
-                    ElementOrModel::Element(weak_parent) => {
+                    ElementOrModel::Element(weak_parent, _) => {
                         let parent = weak_parent.upgrade().ok_or(AutosarDataError::ItemDeleted)?;
                         // avoid deadlocking if the parent is locked, because we're already holding a child lock here
                         let parent_name = {
@@ -336,25 +359,10 @@ impl Element {
     ///    The operation was aborted to avoid a deadlock, but can be retried.
     ///
     pub fn model(&self) -> Result<AutosarModel, AutosarDataError> {
-        let mut cur_elem = self.clone();
-        loop {
-            let parent = {
-                let element = cur_elem
-                    .0
-                    .try_read_for(LOCK_CONTENTION_TIMEOUT)
-                    .ok_or(AutosarDataError::ParentElementLocked)?;
-                match &element.parent {
-                    ElementOrModel::Element(weak_parent) => {
-                        weak_parent.upgrade().ok_or(AutosarDataError::ItemDeleted)?
-                    }
-                    ElementOrModel::Model(weak_arxmlfile) => {
-                        return weak_arxmlfile.upgrade().ok_or(AutosarDataError::ItemDeleted);
-                    }
-                    ElementOrModel::None => return Err(AutosarDataError::ItemDeleted),
-                }
-            };
-            cur_elem = parent;
-        }
+        self.0
+            .try_read_for(LOCK_CONTENTION_TIMEOUT)
+            .ok_or(AutosarDataError::ParentElementLocked)?
+            .model()
     }
 
     /// Get the [`ContentType`] of the current element
@@ -485,8 +493,7 @@ impl Element {
         element_name: ElementName,
         item_name: &str,
     ) -> Result<Element, AutosarDataError> {
-        let model = self.model()?;
-        let version = self.min_version()?;
+        let (model, version) = self.model_and_version()?;
         self.0
             .write()
             .create_named_sub_element(self.downgrade(), element_name, item_name, &model, version)
@@ -529,8 +536,7 @@ impl Element {
         item_name: &str,
         position: usize,
     ) -> Result<Element, AutosarDataError> {
-        let model = self.model()?;
-        let version = self.min_version()?;
+        let (model, version) = self.model_and_version()?;
         self.0
             .write()
             .create_named_sub_element_at(self.downgrade(), element_name, item_name, position, &model, version)
@@ -583,8 +589,7 @@ impl Element {
                 element: self.element_name(),
             });
         }
-        let model = self.model()?;
-        let version = self.min_version()?;
+        let (model, version) = self.model_and_version()?;
         let copy = self
             .0
             .write()
@@ -643,8 +648,7 @@ impl Element {
                 element: self.element_name(),
             });
         }
-        let model = self.model()?;
-        let version = self.min_version()?;
+        let (model, version) = self.model_and_version()?;
         let copy = self
             .0
             .write()
@@ -1030,11 +1034,7 @@ impl Element {
         let locked_element = self.0.try_read_for(LOCK_CONTENTION_TIMEOUT)?;
         for item in &locked_element.content {
             if let ElementContent::Element(sub_element) = item
-                && sub_element
-                    .0
-                    .try_read_for(LOCK_CONTENTION_TIMEOUT)?
-                    .elemname
-                    == name
+                && sub_element.0.try_read_for(LOCK_CONTENTION_TIMEOUT)?.elemname == name
             {
                 return Some(sub_element.clone());
             }
@@ -1232,8 +1232,7 @@ impl Element {
         if (elemtype.content_mode() == ContentMode::Characters || elemtype.content_mode() == ContentMode::Mixed)
             && let Some(cdata_spec) = elemtype.chardata_spec()
         {
-            let model = self.model()?;
-            let version = self.min_version()?;
+            let (model, version) = self.model_and_version()?;
             let mut compatible_value = CharacterData::check_value(&chardata, cdata_spec, version);
             if !compatible_value
                 && matches!(
@@ -1583,7 +1582,7 @@ impl Element {
     }
 
     /// Create an iterator over all sub elements of this element
-    /// 
+    ///
     /// If the element is modified while the iterator is in use, the iterator can skip sub elements or return duplicates.
     ///
     /// # Example
@@ -1735,8 +1734,7 @@ impl Element {
         element_name: ElementName,
         item_name: &str,
     ) -> Result<Element, AutosarDataError> {
-        let model = self.model()?;
-        let version = self.min_version()?;
+        let (model, version) = self.model_and_version()?;
         let mut locked_elem = self.0.try_write().ok_or(AutosarDataError::ParentElementLocked)?;
         for item in &locked_elem.content {
             if let ElementContent::Element(subelem) = item
@@ -2187,9 +2185,10 @@ impl Element {
             if !locked_cur_elem.file_membership.is_empty() {
                 return Ok((cur_elem == self, locked_cur_elem.file_membership.clone()));
             }
+            let parent = locked_cur_elem.parent()?;
             drop(locked_cur_elem);
 
-            cur_elem_opt = cur_elem.parent()?;
+            cur_elem_opt = parent;
         }
 
         // no file membership info found at any level - this only happens if the model does not contain any files
@@ -2508,14 +2507,56 @@ impl Element {
     ///    The operation was aborted to avoid a deadlock, but can be retried.
     ///  - [`AutosarDataError::NoFilesInModel`]: The operation cannot be completed because the model does not contain any files
     pub fn min_version(&self) -> Result<AutosarVersion, AutosarDataError> {
-        let (_, files) = self.file_membership()?;
-        let mut ver = AutosarVersion::LATEST;
-        for f in files.iter().filter_map(WeakArxmlFile::upgrade) {
-            if f.version() < ver {
-                ver = f.version();
-            }
+        let model = self.model()?;
+        self.min_version_in(&model)
+    }
+
+    /// get the model of this element together with its minimum Autosar version
+    ///
+    /// The element creation and modification functions need both values, and getting the version
+    /// requires the model, so getting them separately would look up the model twice.
+    pub(crate) fn model_and_version(&self) -> Result<(AutosarModel, AutosarVersion), AutosarDataError> {
+        let model = self.model()?;
+        let version = self.min_version_in(&model)?;
+        Ok((model, version))
+    }
+
+    /// get the minimum Autosar version of this element, given the model it belongs to
+    fn min_version_in(&self, model: &AutosarModel) -> Result<AutosarVersion, AutosarDataError> {
+        if let Some(version) = model.single_file_version() {
+            // every element of a model with a single file belongs to that file, so its version
+            // applies without looking up the file membership
+            return Ok(version);
         }
-        Ok(ver)
+
+        // the model is split across several files, so the file membership of the element decides.
+        // It is inherited from the closest parent element that has one.
+        let mut cur_elem_opt = Some(self.clone());
+        while let Some(cur_elem) = &cur_elem_opt {
+            let locked_cur_elem = cur_elem
+                .0
+                .try_read_for(LOCK_CONTENTION_TIMEOUT)
+                .ok_or(AutosarDataError::ParentElementLocked)?;
+            if !locked_cur_elem.file_membership.is_empty() {
+                let ver = locked_cur_elem
+                    .file_membership
+                    .iter()
+                    .filter_map(WeakArxmlFile::upgrade)
+                    .map(|f| f.version())
+                    .min()
+                    .unwrap_or(AutosarVersion::LATEST);
+
+                return Ok(ver);
+            }
+            // read the parent while the lock of the current element is still held: going through
+            // Element::parent() instead would acquire the same lock a second time on every level
+            let parent = locked_cur_elem.parent()?;
+            drop(locked_cur_elem);
+
+            cur_elem_opt = parent;
+        }
+
+        Err(AutosarDataError::NoFilesInModel)
     }
 }
 
@@ -2783,7 +2824,7 @@ impl ElementContent {
 impl std::fmt::Debug for ElementOrModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ElementOrModel::Element(_) => f.write_str("Element"),
+            ElementOrModel::Element(..) => f.write_str("Element"),
             ElementOrModel::Model(_) => f.write_str("Model"),
             ElementOrModel::None => f.write_str("None/Invalid"),
         }
@@ -4065,7 +4106,10 @@ mod test {
         el_autosar.set_comment(Some("comment".to_string()));
 
         let mut outstring = String::from(r#"<?xml version="1.0" encoding="utf-8"?>"#);
-        el_autosar.0.read().serialize_internal(&mut outstring, 0, false, &None, None);
+        el_autosar
+            .0
+            .read()
+            .serialize_internal(&mut outstring, 0, false, &None, None);
 
         assert_eq!(FILEBUF, outstring);
     }

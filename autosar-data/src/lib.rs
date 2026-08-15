@@ -127,6 +127,13 @@ pub struct AutosarModel(Arc<RwLock<AutosarModelRaw>>);
 #[derive(Clone)]
 pub(crate) struct WeakAutosarModel(Weak<RwLock<AutosarModelRaw>>);
 
+impl Default for WeakAutosarModel {
+    /// a weak reference that never resolves to a model; used by elements that have no model
+    fn default() -> Self {
+        WeakAutosarModel(Weak::new())
+    }
+}
+
 /// The inner autosar data model (unlocked)
 ///
 /// The model contains the hierarchy of Autosar elements. It can be created manually or loaded from one or more arxml files.
@@ -485,9 +492,33 @@ pub enum ContentType {
 /// root element, the parent is an element. The root element itself has a reference to the `ArxmlFile` structure.
 #[derive(Clone)]
 pub(crate) enum ElementOrModel {
-    Element(WeakElement),
+    /// The element has a parent element. The second field is the model that the element belongs to.
+    ///
+    /// The model is stored here instead of being found by walking up to the root element, because
+    /// `Element::model()` and `Element::min_version()` are called by every operation that creates
+    /// or modifies an element, and the walk costs several atomic operations per level.
+    /// Storing it next to the parent means it cannot be forgotten when an element is re-parented.
+    Element(WeakElement, WeakAutosarModel),
     Model(WeakAutosarModel),
     None, // needed while constructing the data trees, otherwise there's a chicken vs. egg problem
+}
+
+impl ElementOrModel {
+    /// the model that this parent reference leads to, or `None` for a detached element
+    pub(crate) fn model(&self) -> Option<AutosarModel> {
+        match self {
+            ElementOrModel::Element(_, model) | ElementOrModel::Model(model) => model.upgrade(),
+            ElementOrModel::None => None,
+        }
+    }
+
+    /// a weak reference to the model, for use in the parent reference of a new sub element
+    pub(crate) fn weak_model(&self) -> WeakAutosarModel {
+        match self {
+            ElementOrModel::Element(_, model) | ElementOrModel::Model(model) => model.clone(),
+            ElementOrModel::None => WeakAutosarModel::default(),
+        }
+    }
 }
 
 /// Possible kinds of compatibility errors that can be found by `ArxmlFile::check_version_compatibility()`

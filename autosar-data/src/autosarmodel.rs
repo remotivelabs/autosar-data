@@ -247,6 +247,7 @@ impl AutosarModel {
 
         // no lock is held while parsing, so any number of files can be parsed in parallel
         let mut parser = ArxmlParser::new(filename.clone(), buffer, strict);
+        parser.model = self.downgrade();
         let root_element = parser.parse_arxml()?;
         let version = parser.get_fileversion();
         let arxml_file = ArxmlFileRaw {
@@ -639,7 +640,7 @@ impl AutosarModel {
             let mut new_elem_locked = new_element.0.write();
             let old_parent = std::mem::replace(
                 &mut new_elem_locked.parent,
-                ElementOrModel::Element(parent_a.downgrade()),
+                ElementOrModel::Element(parent_a.downgrade(), parent_a_locked.weak_model()),
             );
             // restrict new_element, it is only present in new_file
             let old_file_membership = new_elem_locked.file_membership.clone();
@@ -852,7 +853,7 @@ impl AutosarModel {
                 let mut locked_model = self.0.write();
                 // clear the parent ref of all sub elements in case other handles to them still exist
                 for elem in locked_model.root_element.sub_elements() {
-                    elem.set_parent(ElementOrModel::None);
+                    elem.detach_recursive();
                 }
                 locked_model.root_element.0.write().content.clear();
                 locked_model.root_element.set_file_membership(HashSet::new());
@@ -1282,6 +1283,19 @@ impl AutosarModel {
         broken_refs
     }
 
+    /// Get the [`AutosarVersion`] of the only file of this model, if it has exactly one file
+    ///
+    /// Every element of such a model belongs to that one file, which lets `Element::min_version()`
+    /// skip the search for the file membership of the element.
+    pub(crate) fn single_file_version(&self) -> Option<AutosarVersion> {
+        let file_list = self.file_list();
+        let locked_file_list = file_list.lock();
+        match locked_file_list.as_slice() {
+            [file] => Some(file.version()),
+            _ => None,
+        }
+    }
+
     /// Create a weak reference to this data
     pub(crate) fn downgrade(&self) -> WeakAutosarModel {
         WeakAutosarModel(Arc::downgrade(&self.0))
@@ -1601,6 +1615,21 @@ impl std::fmt::Debug for WeakAutosarModel {
 /// missing from the cache.
 #[cfg(test)]
 impl AutosarModel {
+    /// Check that every element of this model knows which model it belongs to
+    ///
+    /// Each element caches the model next to its parent reference, so every operation that attaches
+    /// a subtree to a model, or moves one from another model, has to update the whole subtree.
+    fn verify_model_links(&self) -> Result<(), String> {
+        for (_, element) in self.root_element().elements_dfs() {
+            match element.model() {
+                Ok(model) if model == *self => {}
+                Ok(_) => return Err(format!("element {} points at a different model", element.xml_path())),
+                Err(error) => return Err(format!("element {} has no model: {error}", element.xml_path())),
+            }
+        }
+        Ok(())
+    }
+
     /// Check that the reference caches agree with the element tree
     ///
     /// The `Err` describes the first inconsistency that was found. Dead `WeakElement`s in the caches
@@ -1610,6 +1639,10 @@ impl AutosarModel {
     // affect them.
     #[allow(clippy::mutable_key_type)]
     pub(crate) fn verify_reference_caches(&self) -> Result<(), String> {
+        // not a cache of the model, but subject to the same rule that every mutating operation has
+        // to keep it consistent, and checked here so that it is covered by the same tests
+        self.verify_model_links()?;
+
         let mut tree_elements = std::collections::HashSet::new();
         // (character data, element) of each reference without a BASE attribute
         let mut absolute_refs: Vec<(String, Element)> = Vec::new();
