@@ -724,8 +724,7 @@ impl AutosarModel {
                 Ok(()) => {
                     // update the file membership of the merged element, if there was any
                     let mut elem_a_locked = elem_a.0.write();
-                    if elem_a_locked.file_membership.is_some()
-                        && elem_a_locked.insert_file_membership(new_file.clone())
+                    if elem_a_locked.file_membership.is_some() && elem_a_locked.insert_file_membership(new_file.clone())
                     {
                         drop(elem_a_locked);
                         undo.push(MergeUndo::FileMembershipExtended {
@@ -1157,7 +1156,7 @@ impl AutosarModel {
     /// Create an iterator over the list of the Autosar paths of all identifiable elements
     ///
     /// The list contains the full Autosar path of each element. It is not sorted.
-    /// 
+    ///
     /// Note: If the model is modified while iterating, the iterator may skip elements or return duplicates.
     ///
     /// # Example
@@ -1630,7 +1629,13 @@ impl AutosarModel {
             }
             // an element that is in no file at all is meaningless: an empty set has to be stored as
             // None, otherwise the is_none() check for "inherits its file membership" is wrong
-            if element.0.read().file_membership.as_deref().is_some_and(HashSet::is_empty) {
+            if element
+                .0
+                .read()
+                .file_membership
+                .as_deref()
+                .is_some_and(HashSet::is_empty)
+            {
                 return Err(format!(
                     "element {} stores an empty file membership instead of None",
                     element.xml_path()
@@ -1784,6 +1789,16 @@ mod test {
         // error: duplicate file name
         let file = model.create_file("test", AutosarVersion::Autosar_00050);
         assert!(file.is_err());
+
+        // the duplicate check also works when the file name is given as a Path / PathBuf
+        let filename = PathBuf::from("test");
+        let file = model.create_file(&filename, AutosarVersion::Autosar_00050);
+        assert!(matches!(
+            file,
+            Err(AutosarDataError::DuplicateFilenameError { verb: "create", .. })
+        ));
+        let file = model.create_file(Path::new("test2"), AutosarVersion::Autosar_00050);
+        assert!(file.is_ok());
     }
 
     #[test]

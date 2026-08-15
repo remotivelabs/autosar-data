@@ -161,7 +161,7 @@ impl ElementsDfsIterator {
     }
 
     /// Returns the next sibling of the last returned element, skipping any sub-elements of the last returned element.
-    /// 
+    ///
     /// If this is called before any element has been returned, the iteration ends immediately and None is returned.
     pub fn next_sibling(&mut self) -> Option<(usize, Element)> {
         // when an element has been returned, next always immediately sets up to show its sub-elements

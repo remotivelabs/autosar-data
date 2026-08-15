@@ -5740,4 +5740,205 @@ mod test {
         );
         assert_eq!(model.verify_reference_caches(), Ok(()));
     }
+
+    #[test]
+    fn set_character_data_on_relative_reference() {
+        // writing the content of a reference which already has a BASE attribute keeps the reference
+        // relative: the new content is resolved against the same reference base, so the reference is
+        // re-registered under the target path that results from combining the two
+        let (model, _el_owner, el_target, el_ref) = build_relative_reference_model();
+        let el_ecu2 = el_target
+            .get_sub_element(ElementName::Elements)
+            .unwrap()
+            .create_named_sub_element(ElementName::EcuInstance, "Ecu2")
+            .unwrap();
+
+        el_ref.set_character_data("Ecu2").unwrap();
+
+        assert_eq!(
+            el_ref
+                .attribute_value(AttributeName::Base)
+                .unwrap()
+                .string_value()
+                .unwrap(),
+            "Base"
+        );
+        assert_eq!(el_ref.get_reference_target().unwrap(), el_ecu2);
+        assert_eq!(
+            model.relative_reference_target(&el_ref.downgrade()).as_deref(),
+            Some("/Target/Ecu2")
+        );
+        assert_eq!(model.get_references_to("/Target/Ecu2").len(), 1);
+        assert!(model.get_references_to("/Target/Ecu").is_empty());
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn set_character_data_incompatible_value() {
+        // a value which is not compatible with the character data spec is rejected
+        let model = AutosarModel::new();
+        model.create_file("test", AutosarVersion::LATEST).unwrap();
+        let el_elements = model
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.create_named_sub_element(ElementName::ArPackage, "Pkg"))
+            .and_then(|e| e.create_sub_element(ElementName::Elements))
+            .unwrap();
+        let el_ecu_instance = el_elements
+            .create_named_sub_element(ElementName::EcuInstance, "Ecu")
+            .unwrap();
+        let el_sleep_mode_supported = el_ecu_instance
+            .create_sub_element(ElementName::SleepModeSupported)
+            .unwrap();
+
+        // SLEEP-MODE-SUPPORTED contains a boolean, so an arbitrary string is not valid
+        assert!(matches!(
+            el_sleep_mode_supported.set_character_data("nonsense"),
+            Err(AutosarDataError::InvalidCharacterData {
+                element: ElementName::SleepModeSupported,
+                ..
+            })
+        ));
+        assert!(el_sleep_mode_supported.character_data().is_none());
+
+        // a valid value is accepted
+        el_sleep_mode_supported.set_character_data(true).unwrap();
+        assert_eq!(
+            el_sleep_mode_supported
+                .character_data()
+                .unwrap()
+                .string_value()
+                .unwrap(),
+            "true"
+        );
+
+        // ABSOLUTE contains a floating point number. Unlike the String and Pattern specs, there is no
+        // fallback which converts the value to a plain string, so a string value is rejected.
+        let el_absolute = el_elements
+            .create_named_sub_element(ElementName::ISignalIPdu, "Pdu")
+            .and_then(|e| e.create_sub_element(ElementName::IPduTimingSpecifications))
+            .and_then(|e| e.create_sub_element(ElementName::IPduTiming))
+            .and_then(|e| e.create_sub_element(ElementName::TransmissionModeDeclaration))
+            .and_then(|e| e.create_sub_element(ElementName::TransmissionModeTrueTiming))
+            .and_then(|e| e.create_sub_element(ElementName::CyclicTiming))
+            .and_then(|e| e.create_sub_element(ElementName::TimePeriod))
+            .and_then(|e| e.create_sub_element(ElementName::Tolerance))
+            .and_then(|e| e.create_sub_element(ElementName::AbsoluteTolerance))
+            .and_then(|e| e.create_sub_element(ElementName::Absolute))
+            .unwrap();
+        assert!(matches!(
+            el_absolute.set_character_data("not a number"),
+            Err(AutosarDataError::InvalidCharacterData {
+                element: ElementName::Absolute,
+                ..
+            })
+        ));
+        el_absolute.set_character_data(1.5).unwrap();
+        assert_eq!(el_absolute.character_data(), Some(CharacterData::Float(1.5)));
+    }
+
+    #[test]
+    fn debug_format_of_elements() {
+        let model = AutosarModel::new();
+        model.create_file("test", AutosarVersion::LATEST).unwrap();
+        let el_ar_package = model
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.create_named_sub_element(ElementName::ArPackage, "Pkg"))
+            .unwrap();
+        let el_short_name = el_ar_package.get_sub_element(ElementName::ShortName).unwrap();
+
+        // an identifiable element shows its name, and its parent is another element
+        let package_text = format!("{el_ar_package:#?}");
+        assert!(package_text.contains(r#"name: "Pkg""#));
+        assert!(package_text.contains("parent: Element"));
+
+        // the content of the SHORT-NAME is character data
+        let short_name_text = format!("{el_short_name:#?}");
+        assert!(short_name_text.contains("Pkg"));
+
+        // the parent of the root element is the model
+        assert!(format!("{:#?}", model.root_element()).contains("parent: Model"));
+
+        // a deleted element has no parent at all, and its weak reference can't be upgraded any more
+        let weak_short_name = el_short_name.downgrade();
+        model
+            .root_element()
+            .get_sub_element(ElementName::ArPackages)
+            .unwrap()
+            .remove_sub_element(el_ar_package)
+            .unwrap();
+        assert!(format!("{el_short_name:#?}").contains("parent: None/Invalid"));
+        drop(el_short_name);
+        assert!(format!("{weak_short_name:#?}").contains("(invalid)"));
+    }
+
+    #[test]
+    fn reference_base_with_additional_sub_elements() {
+        // a REFERENCE-BASE may contain more than just SHORT-LABEL and PACKAGE-REF; the additional
+        // sub elements are not part of the declaration and must be skipped when it is read
+        let (model, el_owner, _el_target, el_ref) = build_relative_reference_model();
+        let el_reference_base = el_owner
+            .get_sub_element(ElementName::ReferenceBases)
+            .and_then(|e| e.get_sub_element(ElementName::ReferenceBase))
+            .unwrap();
+        el_reference_base
+            .create_sub_element(ElementName::IsDefault)
+            .and_then(|e| e.set_character_data(true))
+            .unwrap();
+        el_reference_base
+            .create_sub_element(ElementName::IsGlobal)
+            .and_then(|e| e.set_character_data(false))
+            .unwrap();
+
+        assert_eq!(resolved_reference_base(&el_ref).as_deref(), Some("/Target"));
+        assert_eq!(el_ref.get_reference_target().unwrap().path().unwrap(), "/Target/Ecu");
+        assert!(model.check_references().is_empty());
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn copy_drops_incompatible_optional_attribute() {
+        // copying into a file of an older version filters out everything that is not valid there.
+        // An optional attribute which does not exist in the target version is simply omitted.
+        let model_new = AutosarModel::new();
+        model_new.create_file("new", AutosarVersion::LATEST).unwrap();
+        let el_package_new = model_new
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.create_named_sub_element(ElementName::ArPackage, "Pkg"))
+            .unwrap();
+        let el_short_label = el_package_new
+            .create_sub_element(ElementName::VariationPoint)
+            .and_then(|e| e.create_sub_element(ElementName::ShortLabel))
+            .unwrap();
+        el_short_label.set_character_data("Label").unwrap();
+        el_short_label
+            .set_attribute_string(AttributeName::BlueprintValue, "bpv")
+            .unwrap();
+
+        let model_old = AutosarModel::new();
+        model_old.create_file("old", AutosarVersion::Autosar_4_3_0).unwrap();
+        let el_copy = model_old
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.create_copied_sub_element(&el_package_new))
+            .unwrap();
+
+        let el_short_label_copy = el_copy
+            .get_sub_element(ElementName::VariationPoint)
+            .and_then(|e| e.get_sub_element(ElementName::ShortLabel))
+            .unwrap();
+        assert_eq!(
+            el_short_label_copy.character_data().unwrap().string_value().unwrap(),
+            "Label"
+        );
+        // BLUEPRINT-VALUE does not exist in Autosar_4_3_0, and it is optional, so it was dropped
+        assert!(
+            el_short_label_copy
+                .attribute_value(AttributeName::BlueprintValue)
+                .is_none()
+        );
+    }
 }

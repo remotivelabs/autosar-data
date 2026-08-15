@@ -228,11 +228,13 @@ impl ArxmlFile {
             None => outstring.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>"),
         }
         let file_version = self.0.read().version;
-        model
-            .root_element()
-            .0
-            .read()
-            .serialize_internal(&mut outstring, 0, false, &Some(self.downgrade()), Some(file_version));
+        model.root_element().0.read().serialize_internal(
+            &mut outstring,
+            0,
+            false,
+            &Some(self.downgrade()),
+            Some(file_version),
+        );
 
         Ok(outstring)
     }
@@ -626,5 +628,63 @@ mod test {
         hashset.insert(weak_file);
         let inserted = hashset.insert(weak_file_cloned);
         assert!(!inserted);
+    }
+
+    #[test]
+    fn debug_format_of_dangling_weak_file() {
+        let model = AutosarModel::new();
+        let file = model.create_file("filename", AutosarVersion::LATEST).unwrap();
+        let weak_file = file.downgrade();
+        model.remove_file(&file);
+        drop(file);
+        // the weak reference can no longer be upgraded, so Debug prints the pointer instead of the filename
+        assert!(format!("{weak_file:#?}").contains("(invalid)"));
+    }
+
+    #[test]
+    fn set_filename_rejects_duplicates() {
+        let model = AutosarModel::new();
+        let file_a = model.create_file("a.arxml", AutosarVersion::LATEST).unwrap();
+        let file_b = model.create_file("b.arxml", AutosarVersion::LATEST).unwrap();
+
+        // renaming a file to the name of a different file in the same model is not allowed
+        assert!(matches!(
+            file_b.set_filename("a.arxml"),
+            Err(AutosarDataError::DuplicateFilenameError {
+                verb: "set_filename",
+                ..
+            })
+        ));
+        assert_eq!(file_b.filename(), PathBuf::from("b.arxml"));
+
+        // setting the name a file already has is not a conflict with itself
+        file_a.set_filename("a.arxml").unwrap();
+        assert_eq!(file_a.filename(), PathBuf::from("a.arxml"));
+    }
+
+    #[test]
+    fn serialize_empty_file() {
+        let model = AutosarModel::new();
+        let file_a = model.create_file("a.arxml", AutosarVersion::LATEST).unwrap();
+        let file_b = model.create_file("b.arxml", AutosarVersion::LATEST).unwrap();
+
+        // remove the root element from file_b: now file_b has no content at all
+        model.root_element().remove_from_file(&file_b).unwrap();
+
+        assert!(matches!(file_b.serialize(), Err(AutosarDataError::EmptyFile)));
+        assert!(file_a.serialize().is_ok());
+    }
+
+    #[test]
+    fn operations_on_a_file_whose_model_is_gone() {
+        let file = {
+            let model = AutosarModel::new();
+            model.create_file("test", AutosarVersion::LATEST).unwrap()
+        };
+        // the model has been dropped, so the file can't reach it any more
+        assert!(matches!(file.model(), Err(AutosarDataError::ItemDeleted)));
+        let (errors, mask) = file.check_version_compatibility(AutosarVersion::LATEST);
+        assert!(errors.is_empty());
+        assert_eq!(mask, 0);
     }
 }

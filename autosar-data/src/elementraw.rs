@@ -1464,11 +1464,17 @@ impl ElementRaw {
         if !self.content.is_empty() {
             outstring.push('<');
             outstring.push_str(element_name);
-            if let Some(file_version) = file_version && for_file.is_some() && self.element_name() == ElementName::Autosar {
+            if let Some(file_version) = file_version
+                && for_file.is_some()
+                && self.element_name() == ElementName::Autosar
+            {
                 let mut attributes = self.attributes.clone();
                 for attr in &mut attributes {
                     if attr.attrname == AttributeName::xsiSchemalocation {
-                        attr.content = CharacterData::String(format!("http://autosar.org/schema/r4.0 {}", file_version.filename()));
+                        attr.content = CharacterData::String(format!(
+                            "http://autosar.org/schema/r4.0 {}",
+                            file_version.filename()
+                        ));
                     }
                 }
                 Self::serialize_attributes(&attributes, outstring);
@@ -1482,8 +1488,7 @@ impl ElementRaw {
                     // serialize each sub-element
                     for item in &self.content {
                         if let ElementContent::Element(subelem) = item
-                            && (for_file.is_none()
-                                || subelem.0.read().is_in_file(for_file.as_ref().unwrap()))
+                            && (for_file.is_none() || subelem.0.read().is_in_file(for_file.as_ref().unwrap()))
                         {
                             subelem
                                 .0
@@ -1512,9 +1517,7 @@ impl ElementRaw {
                     for item in &self.content {
                         match item {
                             ElementContent::Element(subelem) => {
-                                if for_file.is_none()
-                                    || subelem.0.read().is_in_file(for_file.as_ref().unwrap())
-                                {
+                                if for_file.is_none() || subelem.0.read().is_in_file(for_file.as_ref().unwrap()) {
                                     subelem
                                         .0
                                         .read()
@@ -1535,11 +1538,17 @@ impl ElementRaw {
         } else {
             outstring.push('<');
             outstring.push_str(element_name);
-            if let Some(file_version) = file_version && for_file.is_some() && self.element_name() == ElementName::Autosar {
+            if let Some(file_version) = file_version
+                && for_file.is_some()
+                && self.element_name() == ElementName::Autosar
+            {
                 let mut attributes = self.attributes.clone();
                 for attr in &mut attributes {
                     if attr.attrname == AttributeName::xsiSchemalocation {
-                        attr.content = CharacterData::String(format!("http://autosar.org/schema/r4.0 {}", file_version.filename()));
+                        attr.content = CharacterData::String(format!(
+                            "http://autosar.org/schema/r4.0 {}",
+                            file_version.filename()
+                        ));
                     }
                 }
                 Self::serialize_attributes(&attributes, outstring);
@@ -1639,5 +1648,67 @@ mod test {
         elem_ar_packages.remove_sub_element(elem_ar_package).unwrap();
         let xml_path = elem_elements.xml_path();
         assert_eq!(xml_path, "/(DELETED)/<ELEMENTS>");
+    }
+
+    #[test]
+    fn test_xml_path_with_missing_name() {
+        // a non-strict load accepts an AR-PACKAGE without a SHORT-NAME. The element type is still one
+        // of the named types, so xml_path has to state that the name is missing
+        const FILEBUF: &[u8] = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES><AR-PACKAGE>
+          <ELEMENTS><ECU-INSTANCE><SHORT-NAME>Ecu</SHORT-NAME></ECU-INSTANCE></ELEMENTS>
+        </AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#
+            .as_bytes();
+        let model = AutosarModel::new();
+        let (_file, warnings) = model.load_buffer(FILEBUF, "test", false).unwrap();
+        assert!(!warnings.is_empty());
+
+        let elem_ecu_instance = model
+            .root_element()
+            .get_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.get_sub_element(ElementName::ArPackage))
+            .and_then(|e| e.get_sub_element(ElementName::Elements))
+            .and_then(|e| e.get_sub_element(ElementName::EcuInstance))
+            .unwrap();
+        assert_eq!(
+            elem_ecu_instance.xml_path(),
+            "/<AUTOSAR>/<AR-PACKAGES>/<AR-PACKAGE>(name missing)/<ELEMENTS>/Ecu"
+        );
+    }
+
+    #[test]
+    fn test_remove_required_attribute() {
+        let model = AutosarModel::new();
+        model.create_file("test", AutosarVersion::LATEST).unwrap();
+        let elem_ar_package = model
+            .root_element()
+            .create_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.create_named_sub_element(ElementName::ArPackage, "Pkg"))
+            .unwrap();
+        let elem_elements = elem_ar_package.create_sub_element(ElementName::Elements).unwrap();
+        let elem_ecu_instance = elem_elements
+            .create_named_sub_element(ElementName::EcuInstance, "Ecu")
+            .unwrap();
+        let elem_reference = elem_elements
+            .create_named_sub_element(ElementName::System, "System")
+            .and_then(|e| e.create_sub_element(ElementName::FibexElements))
+            .and_then(|e| e.create_sub_element(ElementName::FibexElementRefConditional))
+            .and_then(|e| e.create_sub_element(ElementName::FibexElementRef))
+            .unwrap();
+        elem_reference.set_reference_target(&elem_ecu_instance).unwrap();
+
+        // DEST is a required attribute of a reference, so it cannot be removed
+        assert!(!elem_reference.remove_attribute(AttributeName::Dest));
+        assert!(elem_reference.attribute_value(AttributeName::Dest).is_some());
+
+        // an optional attribute can be removed
+        elem_ar_package
+            .set_attribute_string(AttributeName::Uuid, "12345")
+            .unwrap();
+        assert!(elem_ar_package.remove_attribute(AttributeName::Uuid));
+
+        // an attribute which is not set at all cannot be removed either
+        assert!(!elem_ar_package.remove_attribute(AttributeName::Uuid));
     }
 }

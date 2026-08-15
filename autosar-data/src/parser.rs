@@ -254,6 +254,13 @@ pub enum ArxmlParserError {
         /// The invalid XML entity
         input: String,
     },
+
+    /// An element contains a SHORT-NAME which has no content
+    #[error("The SHORT-NAME of element {element} is empty")]
+    EmptyShortName {
+        /// The element whose SHORT-NAME is empty
+        element: ElementName,
+    },
 }
 
 pub(crate) struct ArxmlParser<'a> {
@@ -508,6 +515,16 @@ impl<'a> ArxmlParser<'a> {
                                 new_path.push_str(name_string);
                                 path = Cow::from(new_path.clone());
                                 self.identifiables.push((new_path, wrapped_element.downgrade()));
+                            } else {
+                                // An empty SHORT-NAME is not recoverable, so this is an error even when
+                                // strict == false: the element would report is_identifiable() == true while
+                                // having no name, so it could not be added to the path index of the model
+                                // and could never be found or referred to. Omitting the SHORT-NAME entirely
+                                // is a different case, which non-strict parsing still accepts: the element
+                                // is then consistently treated as not identifiable.
+                                return Err(self.error(ArxmlParserError::EmptyShortName {
+                                    element: element.elemname,
+                                }));
                             }
                         }
                         element.content.push(ElementContent::Element(sub_element));
@@ -1495,6 +1512,93 @@ mod test {
         test_helper(INVALID_NUMBER.as_bytes(), discriminant, true);
     }
 
+    const EMPTY_SHORT_NAME: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <AR-PACKAGES><AR-PACKAGE><SHORT-NAME></SHORT-NAME>
+      <ELEMENTS><ECU-INSTANCE><SHORT-NAME>Ecu</SHORT-NAME></ECU-INSTANCE></ELEMENTS>
+    </AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#;
+
+    // a SHORT-NAME which only contains whitespace: the lexer discards whitespace-only character
+    // data, so this is the same case as a SHORT-NAME with no content at all
+    const WHITESPACE_SHORT_NAME: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>   </SHORT-NAME>
+    </AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#;
+
+    // a SHORT-NAME which contains only a comment is also empty
+    const COMMENT_SHORT_NAME: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <AR-PACKAGES><AR-PACKAGE><SHORT-NAME><!--the name goes here--></SHORT-NAME>
+    </AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#;
+
+    // an AR-PACKAGE with no SHORT-NAME at all is a different case: the element is then consistently
+    // not identifiable, so non-strict parsing still accepts it
+    const MISSING_SHORT_NAME: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <AR-PACKAGES><AR-PACKAGE>
+      <ELEMENTS><ECU-INSTANCE><SHORT-NAME>Ecu</SHORT-NAME></ECU-INSTANCE></ELEMENTS>
+    </AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#;
+
+    #[test]
+    fn test_empty_short_name() {
+        // an empty SHORT-NAME is rejected in strict mode as well as in non-strict mode: an element
+        // with an empty SHORT-NAME would claim to be identifiable while having no name, so it could
+        // never be found by path or referred to
+        for buffer in [EMPTY_SHORT_NAME, WHITESPACE_SHORT_NAME, COMMENT_SHORT_NAME] {
+            for strict in [true, false] {
+                let mut parser = ArxmlParser::new(PathBuf::from("test_buffer.arxml"), buffer.as_bytes(), strict);
+                let result = parser.parse_arxml();
+                println!("strict={strict}, result={result:?}");
+                assert!(matches!(
+                    result,
+                    Err(AutosarDataError::ParserError {
+                        source: ArxmlParserError::EmptyShortName {
+                            element: ElementName::ArPackage
+                        },
+                        ..
+                    })
+                ));
+                // the error is not downgraded to a warning when strict == false
+                assert!(parser.warnings.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_missing_short_name_is_not_an_empty_short_name() {
+        // omitting the SHORT-NAME is still only a warning in non-strict mode
+        let model = AutosarModel::new();
+        let (_file, warnings) = model
+            .load_buffer(MISSING_SHORT_NAME.as_bytes(), "test.arxml", false)
+            .unwrap();
+        assert!(matches!(
+            warnings.first(),
+            Some(AutosarDataError::ParserError {
+                source: ArxmlParserError::RequiredSubelementMissing {
+                    element: ElementName::ArPackage,
+                    sub_element: ElementName::ShortName,
+                },
+                ..
+            })
+        ));
+        let el_ar_package = model
+            .root_element()
+            .get_sub_element(ElementName::ArPackages)
+            .and_then(|e| e.get_sub_element(ElementName::ArPackage))
+            .unwrap();
+        assert!(!el_ar_package.is_identifiable());
+
+        // ... and an error in strict mode
+        let model = AutosarModel::new();
+        assert!(matches!(
+            model.load_buffer(MISSING_SHORT_NAME.as_bytes(), "test.arxml", true),
+            Err(AutosarDataError::ParserError {
+                source: ArxmlParserError::RequiredSubelementMissing { .. },
+                ..
+            })
+        ));
+    }
+
     const ADDITIONAL_DATA: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
     </AUTOSAR>
@@ -1821,6 +1925,10 @@ mod test {
         let result = parser.parse_attribute_text(etype_arpackage, br#"UUID="#);
         assert!(result.is_err());
 
+        // the attribute value is not enclosed in quotes
+        let result = parser.parse_attribute_text(etype_arpackage, br#"UUID=1234"#);
+        assert!(result.is_err());
+
         // valid UUID attribute
         let value = parser
             .parse_attribute_text(etype_arpackage, br#"UUID="12345678""#)
@@ -1891,5 +1999,96 @@ mod test {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parse_attribute_text_non_strict() {
+        let mut parser = ArxmlParser::new(PathBuf::from("test"), &[], false);
+        let etype_arpackage = ElementType::ROOT
+            .find_sub_element(ElementName::ArPackages, u32::MAX)
+            .unwrap()
+            .0
+            .find_sub_element(ElementName::ArPackage, u32::MAX)
+            .unwrap()
+            .0;
+
+        // in non-strict mode a duplicate attribute is only a warning, and the last value wins
+        let value = parser
+            .parse_attribute_text(etype_arpackage, br#" UUID="1"  UUID="2""#)
+            .unwrap();
+        assert_eq!(value.len(), 1);
+        assert_eq!(value[0].attrname, AttributeName::Uuid);
+        assert_eq!(value[0].content.to_string(), "2");
+        assert!(matches!(
+            parser.warnings.first(),
+            Some(AutosarDataError::ParserError {
+                source: ArxmlParserError::DuplicateAttributeError { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_invalid_numbers_non_strict() {
+        let mut parser = ArxmlParser::new(PathBuf::from("test"), &[], false);
+
+        // an unsigned integer which cannot be parsed becomes 0, and a warning is recorded
+        let value = parser
+            .parse_character_data(b"not a number", &CharacterDataSpec::UnsignedInteger)
+            .unwrap();
+        assert_eq!(value, CharacterData::UnsignedInteger(0));
+
+        // a float which is not finite is rejected in the same way
+        let value = parser.parse_character_data(b"inf", &CharacterDataSpec::Float).unwrap();
+        assert_eq!(value, CharacterData::Float(0.0));
+
+        assert_eq!(parser.warnings.len(), 2);
+        for warning in &parser.warnings {
+            assert!(matches!(
+                warning,
+                AutosarDataError::ParserError {
+                    source: ArxmlParserError::InvalidNumber { .. },
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn unescape_entities_non_strict() {
+        let mut parser = ArxmlParser::new(PathBuf::from("test_buffer.arxml"), &[], false);
+
+        // an unknown entity is passed through unchanged
+        let result = parser.unescape_string("a&nbsp;b").unwrap();
+        assert_eq!(&result, "a&nbsp;b");
+
+        // a hexadecimal character reference with a value that is not a valid code point
+        let result = parser.unescape_string("a&#xZZ;b").unwrap();
+        assert_eq!(&result, "a&#xZZ;b");
+        let result = parser.unescape_string("a&#xD800;b").unwrap();
+        assert_eq!(&result, "a&#xD800;b");
+
+        // a decimal character reference with a value that is not a valid code point
+        let result = parser.unescape_string("a&#abcde;b").unwrap();
+        assert_eq!(&result, "a&#abcde;b");
+        let result = parser.unescape_string("a&#1114112;b").unwrap();
+        assert_eq!(&result, "a&#1114112;b");
+
+        // character references whose terminating ';' is missing
+        let result = parser.unescape_string("a&#x41b").unwrap();
+        assert_eq!(&result, "a&#x41b");
+        let result = parser.unescape_string("a&#65b").unwrap();
+        assert_eq!(&result, "a&#65b");
+
+        assert_eq!(parser.warnings.len(), 7);
+        for warning in &parser.warnings {
+            assert!(matches!(
+                warning,
+                AutosarDataError::ParserError {
+                    source: ArxmlParserError::InvalidXmlEntity { .. },
+                    ..
+                }
+            ));
+        }
     }
 }

@@ -459,6 +459,64 @@ mod test {
     }
 
     #[test]
+    fn test_malformed_xml_header_attributes() {
+        // each of these breaks out of the attribute loop of read_xml_header in a different place
+        let malformed: &[&[u8]] = &[
+            // an attribute without a value: there is no '=' left in the remaining text
+            br#"<?xml version="1.0" encoding="utf-8" standalone?>"#,
+            // an empty attribute name
+            br#"<?xml ="1.0"?>"#,
+            // an attribute name containing whitespace
+            br#"<?xml version number="1.0"?>"#,
+            // an unquoted attribute value
+            br#"<?xml version=1.0?>"#,
+            // an attribute value whose closing quote is missing
+            br#"<?xml version="1.0?>"#,
+        ];
+        for data in malformed {
+            println!("checking: {}", String::from_utf8_lossy(data));
+            let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+            assert!(
+                matches!(lexer.next(), Err(AutosarDataError::LexerError{source, ..}) if source == ArxmlLexerError::InvalidXmlHeader)
+            );
+        }
+    }
+
+    #[test]
+    fn test_xml_header_with_single_quotes_and_standalone() {
+        let data = br#"<?xml version='1.0' encoding='UTF8' standalone='yes'?><element>"#;
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::ArxmlHeader(Some(true))))));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, _))) if elem == b"element"));
+    }
+
+    #[test]
+    fn test_processing_instruction_is_ignored() {
+        // a processing instruction which is not the xml header is skipped, and the lexer continues
+        // with the next event
+        let data = b"<?php echo 'hello'; ?><element>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, _))) if elem == b"element"));
+    }
+
+    #[test]
+    fn test_malformed_comment() {
+        // '<!' is treated as the start of a comment, but this is not one, even though it ends with '-->'
+        let data = b"<!DOCTYPE something -->";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Err(AutosarDataError::LexerError{source, ..}) if source == ArxmlLexerError::InvalidComment)
+        );
+
+        // a comment which is too short to contain both the opening and the closing marker
+        let data = b"<!-->";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Err(AutosarDataError::LexerError{source, ..}) if source == ArxmlLexerError::InvalidComment)
+        );
+    }
+
+    #[test]
     fn traits() {
         // ArxmlLexerError: Debug, Error, Eq, PartialEq, Clone
         let err = ArxmlLexerError::IncompleteData;
