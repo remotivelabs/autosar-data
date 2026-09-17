@@ -23,6 +23,10 @@ pub enum ArxmlParserError {
     #[error("Invalid arxml file: bad file header")]
     InvalidArxmlFileHeader,
 
+    /// The root element declares no namespace, and the schema is named by a bare `schemaLocation`
+    #[error("The AUTOSAR element declares no namespace; taking the schema from its schemaLocation attribute")]
+    NamespacelessFileHeader,
+
     /// An XML file header was unexpectedly found inside the ARXML data
     #[error("Unexpected XML file header found inside ARXML data")]
     UnexpectedXmlFileHeader {
@@ -354,7 +358,7 @@ impl<'a> ArxmlParser<'a> {
             && let Ok(ElementName::Autosar) = ElementName::from_bytes(elemname)
         {
             let attributes = self.parse_attribute_text(ElementType::ROOT, attributes_text)?;
-            self.parse_file_header(&attributes)?;
+            self.parse_file_header(&attributes, attributes_text)?;
 
             let new_element = ElementRaw {
                 parent: ElementOrModel::None,
@@ -375,7 +379,11 @@ impl<'a> ArxmlParser<'a> {
     }
 
     /// parse the arxml file header
-    fn parse_file_header(&mut self, attributes: &SmallVec<[Attribute; 1]>) -> Result<(), AutosarDataError> {
+    fn parse_file_header(
+        &mut self,
+        attributes: &SmallVec<[Attribute; 1]>,
+        attributes_text: &[u8],
+    ) -> Result<(), AutosarDataError> {
         let attr_xmlns = attributes.iter().find(|attr| attr.attrname == AttributeName::xmlns);
         let attr_xsi = attributes.iter().find(|attr| attr.attrname == AttributeName::xmlnsXsi);
         let attr_schema = attributes
@@ -400,6 +408,13 @@ impl<'a> ArxmlParser<'a> {
                 return Err(self.error(ArxmlParserError::InvalidArxmlFileHeader));
             }
             self.fileversion = self.parse_file_version(schema)?;
+
+            Ok(())
+        } else if let Some(schema) = bare_schema_location(attributes_text) {
+            // A tool that rewrites a file can drop the namespace declarations and leave the schema
+            // named by a bare schemaLocation. Strict parsing still refuses such a file.
+            self.optional_error(ArxmlParserError::NamespacelessFileHeader)?;
+            self.fileversion = self.parse_file_version(&schema)?;
 
             Ok(())
         } else {
@@ -1044,7 +1059,7 @@ impl<'a> ArxmlParser<'a> {
             if let Ok(ArxmlEvent::BeginElement(elemname, attributes_text)) = arxmlevent
                 && let Ok(ElementName::Autosar) = ElementName::from_bytes(elemname)
                 && let Ok(attributes) = self.parse_attribute_text(ElementType::ROOT, attributes_text)
-                && self.parse_file_header(&attributes).is_ok()
+                && self.parse_file_header(&attributes, attributes_text).is_ok()
             {
                 // no errors after parsing the header - this looks like an arxml file
                 return true;
@@ -1055,9 +1070,68 @@ impl<'a> ArxmlParser<'a> {
     }
 }
 
+/// the value of a `schemaLocation` attribute that carries no namespace prefix
+fn bare_schema_location(attributes_text: &[u8]) -> Option<String> {
+    const NAME: &[u8] = b"schemaLocation";
+
+    let mut start = 0;
+    while let Some(found) = attributes_text[start..]
+        .windows(NAME.len())
+        .position(|window| window == NAME)
+    {
+        let at = start + found;
+        start = at + NAME.len();
+        // an xsi:schemaLocation is the prefixed form, which is parsed as an attribute already
+        if at > 0 && !attributes_text[at - 1].is_ascii_whitespace() {
+            continue;
+        }
+
+        let rest = attributes_text[start..].trim_ascii_start();
+        let Some(rest) = rest.strip_prefix(b"=") else {
+            continue;
+        };
+        let rest = rest.trim_ascii_start();
+        let Some((quote, rest)) = rest.split_first() else {
+            continue;
+        };
+        if *quote != b'"' && *quote != b'\'' {
+            continue;
+        }
+        let Some(end) = rest.iter().position(|c| c == quote) else {
+            continue;
+        };
+        return String::from_utf8(rest[..end].to_vec()).ok();
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod test {
     use crate::parser::*;
+
+    #[test]
+    fn test_file_header_without_namespaces() {
+        // a tool that rewrites a file can leave the root element with only a bare schemaLocation
+        let data =
+            br#"<?xml version="1.0" ?><AUTOSAR schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00049.xsd">
+        <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#;
+
+        let mut parser = ArxmlParser::new(PathBuf::from("test.arxml"), data, true);
+        assert!(parser.parse_arxml().is_err(), "strict parsing refuses it");
+
+        let mut parser = ArxmlParser::new(PathBuf::from("test.arxml"), data, false);
+        assert!(parser.parse_arxml().is_ok());
+        assert_eq!(parser.fileversion, AutosarVersion::Autosar_00049);
+        assert!(parser.warnings.iter().any(|w| matches!(
+            w,
+            AutosarDataError::ParserError {
+                source: ArxmlParserError::NamespacelessFileHeader,
+                ..
+            }
+        )));
+    }
+
     use crate::*;
 
     fn test_helper(buffer: &[u8], target_error: std::mem::Discriminant<ArxmlParserError>, optional: bool) {
