@@ -19,8 +19,10 @@ pub enum ArxmlLexerError {
     #[error("A processing instruction was started with '<?', but it did not end with '?>'")]
     InvalidProcessingInstruction,
 
-    /// Invalid arxml header: The xml header of an arxml file must specify version="1.0" encoding="utf-8"
-    #[error("Invalid arxml header: The xml header of an arxml file must specify version=\"1.0\" encoding=\"utf-8\"")]
+    /// Invalid arxml header: The xml header of an arxml file must specify version="1.0", and encoding="utf-8" if it declares one
+    #[error(
+        "Invalid arxml header: The xml header of an arxml file must specify version=\"1.0\", and encoding=\"utf-8\" if it declares one"
+    )]
     InvalidXmlHeader,
 
     /// Invalid comment: Comments must start with '<!--' and end with '-->'
@@ -227,10 +229,14 @@ impl<'a> ArxmlLexer<'a> {
                 }
             };
 
-            if !valid
-                || ver != b"1.0"
-                || (encoding != b"utf-8" && encoding != b"UTF-8" && encoding != b"utf8" && encoding != b"UTF8")
-            {
+            // XML 1.0 5th ed. section 4.3.3: the encoding declaration is optional, and an entity
+            // without one is UTF-8.
+            let encoding_ok = encoding.is_empty()
+                || encoding == b"utf-8"
+                || encoding == b"UTF-8"
+                || encoding == b"utf8"
+                || encoding == b"UTF8";
+            if !valid || ver != b"1.0" || !encoding_ok {
                 Some(Err(self.error(ArxmlLexerError::InvalidXmlHeader)))
             } else {
                 Some(Ok(ArxmlEvent::ArxmlHeader(standalone)))
@@ -480,6 +486,15 @@ mod test {
                 matches!(lexer.next(), Err(AutosarDataError::LexerError{source, ..}) if source == ArxmlLexerError::InvalidXmlHeader)
             );
         }
+    }
+
+    #[test]
+    fn test_xml_header_without_encoding() {
+        // the encoding declaration is optional; some tools write the header without it
+        let data = br#"<?xml version="1.0" ?><element>"#;
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::ArxmlHeader(None)))));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, _))) if elem == b"element"));
     }
 
     #[test]
