@@ -172,7 +172,7 @@ impl<'a> ArxmlLexer<'a> {
         debug_assert!(endpos > self.bufpos + 1);
         debug_assert!(self.buffer[self.bufpos] == b'<');
 
-        if self.buffer[endpos - 1] != b'?' {
+        if endpos < self.bufpos + 3 || self.buffer[endpos - 1] != b'?' {
             return Some(Err(self.error(ArxmlLexerError::InvalidProcessingInstruction)));
         }
 
@@ -429,6 +429,28 @@ mod test {
         assert!(
             matches!(lexer.next(), Err(AutosarDataError::LexerError{source, ..}) if source == ArxmlLexerError::InvalidProcessingInstruction)
         );
+    }
+
+    #[test]
+    fn test_empty_processing_instruction() {
+        // in '<?>' the '?' after '<' is also the one before '>', so there is no room for a name
+        let data = b"<?>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(
+            matches!(lexer.next(), Err(AutosarDataError::LexerError{source, ..}) if source == ArxmlLexerError::InvalidProcessingInstruction)
+        );
+
+        let data = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<?>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::ArxmlHeader(None)))));
+        assert!(
+            matches!(lexer.next(), Err(AutosarDataError::LexerError{source, ..}) if source == ArxmlLexerError::InvalidProcessingInstruction)
+        );
+
+        // the shortest processing instruction is still skipped like any other
+        let data = b"<?x?><element>";
+        let mut lexer = ArxmlLexer::new(data, PathBuf::from("(buffer)"));
+        assert!(matches!(lexer.next(), Ok((_, ArxmlEvent::BeginElement(elem, _))) if elem == b"element"));
     }
 
     #[test]
