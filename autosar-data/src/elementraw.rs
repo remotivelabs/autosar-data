@@ -173,7 +173,7 @@ impl ElementRaw {
                     // and references, all of which are affected by the new path
                     let remap = PathRemap::single(old_path, new_path);
                     model.fix_element_paths(&remap);
-                    model.fix_reference_paths(&remap, version)?;
+                    model.fix_reference_paths(&remap);
                 }
             }
 
@@ -736,7 +736,7 @@ impl ElementRaw {
                 Ok(move_element.clone())
             } else {
                 // move the element within the same model
-                self.move_element_local(self_weak, move_element, end_pos, model, version)
+                self.move_element_local(self_weak, move_element, end_pos, model)
             }
         } else {
             // move the element between different models
@@ -774,7 +774,7 @@ impl ElementRaw {
                     self.move_element_position(move_element, position)
                 } else {
                     // move the element within the same model
-                    self.move_element_local(self_weak, move_element, position, model, version)
+                    self.move_element_local(self_weak, move_element, position, model)
                 }
             } else {
                 // move the element between different models
@@ -825,7 +825,6 @@ impl ElementRaw {
         move_element: &Element,
         position: usize,
         model: &AutosarModel,
-        version: AutosarVersion,
     ) -> Result<Element, AutosarDataError> {
         // check if self (target of the move) is a sub element of new_element
         // if it is, then the move is not allowed
@@ -924,7 +923,7 @@ impl ElementRaw {
         // fix the caches which record where the moved elements are, then update all references
         // pointing into the moved subtree, since the move happened within a single model
         model.fix_element_paths(&remap);
-        model.fix_reference_paths(&remap, version)?;
+        model.fix_reference_paths(&remap);
 
         // reset the file membership of the moved element and all its sub elements: there's no guarantee that the
         // moved element shares any files with its new parent, so the parent might be skipped for all files that
@@ -1266,6 +1265,17 @@ impl ElementRaw {
     ) -> Result<(), AutosarDataError> {
         let chardata: CharacterData = value.into();
         self.set_character_data_internal(chardata, version)
+    }
+
+    /// Replace the text of a reference whose target was renamed or moved, without validating it
+    ///
+    /// Only the path prefix of the target changes, so a valid reference stays valid. A reference that
+    /// was loaded with strict == false can be invalid, e.g. "/Pkg/Sig!"; refusing to rewrite it would
+    /// leave the rename or move half done, so it keeps its invalid suffix instead.
+    pub(crate) fn set_remapped_reference(&mut self, new_reference: String) {
+        self.content.clear();
+        self.content
+            .push(ElementContent::CharacterData(CharacterData::String(new_reference)));
     }
 
     // set the character data of this element - separated out since this part is not generic
