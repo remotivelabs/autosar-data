@@ -9,10 +9,10 @@ use std::str::FromStr;
 use std::str::Utf8Error;
 use thiserror::Error;
 
-use crate::WeakAutosarModel;
 use crate::lexer::{ArxmlEvent, ArxmlLexer};
 use crate::{
-    Attribute, AutosarDataError, CharacterData, Element, ElementContent, ElementOrModel, ElementRaw, WeakElement,
+    Attribute, AutosarDataError, CharacterData, Element, ElementContent, ElementOrModel, ElementRaw, FxIndexMap,
+    WeakAutosarModel, WeakElement,
 };
 
 #[derive(Debug, Error, PartialEq)]
@@ -272,6 +272,15 @@ pub enum ArxmlParserError {
         /// The maximum number of nested element levels, counting the AUTOSAR root element as one
         limit: usize,
     },
+
+    /// Two elements in the file have the same Autosar path
+    #[error("The path {path} of element {element} is already used by another element in the file")]
+    DuplicateItemName {
+        /// The element whose path is already used
+        element: ElementName,
+        /// The Autosar path used by both elements
+        path: String,
+    },
 }
 
 /// The maximum number of nested element levels in a file, counting the AUTOSAR root element as one.
@@ -289,7 +298,7 @@ pub(crate) struct ArxmlParser<'a> {
     current_element: ElementName,
     strict: bool,
     version_compatibility: u32,
-    pub(crate) identifiables: Vec<(String, WeakElement)>,
+    pub(crate) identifiables: FxIndexMap<String, WeakElement>,
     pub(crate) references: Vec<(String, WeakElement, Option<String>)>,
     pub(crate) warnings: Vec<AutosarDataError>,
     standalone: Option<bool>,
@@ -307,7 +316,7 @@ impl<'a> ArxmlParser<'a> {
             strict,
             version_compatibility: u32::MAX,
             model: WeakAutosarModel::default(),
-            identifiables: Vec::new(),
+            identifiables: FxIndexMap::default(),
             references: Vec::new(),
             warnings: Vec::new(),
             standalone: None,
@@ -504,6 +513,29 @@ impl<'a> ArxmlParser<'a> {
         self.standalone
     }
 
+    /// Elements with the same path are an error unless one of them has a VARIATION-POINT: variants
+    /// may share a short name when they exclude each other, which depends on system constants
+    /// that the parser does not know
+    fn check_duplicate_path(&mut self, element: &ElementRaw, path: String) -> Result<(), AutosarDataError> {
+        let has_variation_point = |element: &ElementRaw| {
+            element.content.iter().any(
+                |content| matches!(content, ElementContent::Element(sub) if sub.element_name() == ElementName::VariationPoint),
+            )
+        };
+        let first_has_variation_point = self
+            .identifiables
+            .get(&path)
+            .and_then(WeakElement::upgrade)
+            .is_some_and(|first| has_variation_point(&first.0.read()));
+        if has_variation_point(element) || first_has_variation_point {
+            return Ok(());
+        }
+        self.optional_error(ArxmlParserError::DuplicateItemName {
+            element: element.elemname,
+            path,
+        })
+    }
+
     /// parse a single element of an arxml file
     ///
     /// `depth` is the nesting level of the element, where the AUTOSAR root element is level 1
@@ -519,6 +551,7 @@ impl<'a> ArxmlParser<'a> {
 
         let mut elem_idx: Vec<usize> = Vec::new();
         let mut short_name_found = false;
+        let mut duplicate_path = None;
 
         let mut stored_comment = None;
         loop {
@@ -569,7 +602,14 @@ impl<'a> ArxmlParser<'a> {
                                 new_path.push('/');
                                 new_path.push_str(name_string);
                                 path = Cow::from(new_path.clone());
-                                self.identifiables.push((new_path, wrapped_element.downgrade()));
+                                if self.identifiables.contains_key(&new_path) {
+                                    // only one element can be found by its path, so the first one is kept.
+                                    // Whether this is an error depends on the VARIATION-POINT, which follows
+                                    // the SHORT-NAME, so it is decided at the end of the element
+                                    duplicate_path = Some(new_path);
+                                } else {
+                                    self.identifiables.insert(new_path, wrapped_element.downgrade());
+                                }
                             } else {
                                 // An empty SHORT-NAME is not recoverable, so this is an error even when
                                 // strict == false: the element would report is_identifiable() == true while
@@ -593,6 +633,9 @@ impl<'a> ArxmlParser<'a> {
                 ArxmlEvent::EndElement(elem_text) => {
                     if let Ok(name) = ElementName::from_bytes(elem_text) {
                         if name == element.elemname {
+                            if let Some(path) = duplicate_path {
+                                self.check_duplicate_path(&element, path)?;
+                            }
                             break;
                         }
                         return Err(self.error(ArxmlParserError::IncorrectEndElement {
@@ -1859,6 +1902,65 @@ mod test {
             })
             .unwrap();
         handle.join().unwrap();
+    }
+
+    const DUPLICATE_SHORT_NAME: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><ELEMENTS>
+      <I-SIGNAL><SHORT-NAME>S</SHORT-NAME><LENGTH>1</LENGTH></I-SIGNAL>
+      <I-SIGNAL><SHORT-NAME>S</SHORT-NAME><LENGTH>2</LENGTH></I-SIGNAL>
+    </ELEMENTS></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#;
+
+    #[test]
+    fn test_duplicate_short_name() {
+        // two elements with the same path in one file: only one of them can be found by its path
+        let is_duplicate_item_name = |error: &AutosarDataError| {
+            matches!(
+                error,
+                AutosarDataError::ParserError {
+                    source: ArxmlParserError::DuplicateItemName {
+                        element: ElementName::ISignal,
+                        path,
+                    },
+                    ..
+                } if path == "/Pkg/S"
+            )
+        };
+
+        // strict: an error
+        let model = AutosarModel::new();
+        let result = model.load_buffer(DUPLICATE_SHORT_NAME.as_bytes(), "test.arxml", true);
+        assert!(is_duplicate_item_name(&result.unwrap_err()));
+
+        // non-strict: a warning, and the path leads to the first element, as before
+        let model = AutosarModel::new();
+        let (_, warnings) = model
+            .load_buffer(DUPLICATE_SHORT_NAME.as_bytes(), "test.arxml", false)
+            .unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(is_duplicate_item_name(&warnings[0]));
+        let length = model
+            .get_element_by_path("/Pkg/S")
+            .and_then(|signal| signal.get_sub_element(ElementName::Length))
+            .and_then(|length| length.character_data()?.string_value());
+        assert_eq!(length.as_deref(), Some("1"));
+    }
+
+    const DUPLICATE_SHORT_NAME_IN_VARIANTS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <AR-PACKAGES>
+      <AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><VARIATION-POINT><SHORT-LABEL>A</SHORT-LABEL></VARIATION-POINT></AR-PACKAGE>
+      <AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><VARIATION-POINT><SHORT-LABEL>B</SHORT-LABEL></VARIATION-POINT></AR-PACKAGE>
+    </AR-PACKAGES></AUTOSAR>"#;
+
+    #[test]
+    fn test_duplicate_short_name_in_variants() {
+        // elements in variants may share a short name, since the variants can exclude each other
+        let model = AutosarModel::new();
+        let (_, warnings) = model
+            .load_buffer(DUPLICATE_SHORT_NAME_IN_VARIANTS.as_bytes(), "test.arxml", true)
+            .unwrap();
+        assert!(warnings.is_empty());
     }
 
     #[test]
