@@ -350,7 +350,7 @@ impl<'a> ArxmlParser<'a> {
         let mut stored_comment = None;
         let mut token = self.next(&mut lexer)?;
         while let ArxmlEvent::Comment(comment_bytes) = token {
-            stored_comment = Some(String::from_utf8_lossy(comment_bytes).into());
+            stored_comment = Some(self.parse_comment(comment_bytes)?);
             token = self.next(&mut lexer)?;
         }
 
@@ -376,6 +376,17 @@ impl<'a> ArxmlParser<'a> {
             return Ok(autosar_root_element);
         }
         Err(self.error(ArxmlParserError::InvalidArxmlFileHeader))
+    }
+
+    /// convert the text of a comment to a string; invalid utf-8 is an error when strict == true
+    fn parse_comment(&mut self, comment_bytes: &[u8]) -> Result<String, AutosarDataError> {
+        match std::str::from_utf8(comment_bytes) {
+            Ok(comment) => Ok(comment.to_owned()),
+            Err(err) => {
+                self.optional_error(ArxmlParserError::Utf8Error { source: err })?;
+                Ok(String::from_utf8_lossy(comment_bytes).into_owned())
+            }
+        }
     }
 
     /// parse the arxml file header
@@ -608,7 +619,7 @@ impl<'a> ArxmlParser<'a> {
                     }));
                 }
                 ArxmlEvent::Comment(comment_bytes) => {
-                    stored_comment = Some(String::from_utf8_lossy(comment_bytes).into());
+                    stored_comment = Some(self.parse_comment(comment_bytes)?);
                 }
             }
         }
@@ -1558,6 +1569,42 @@ mod test {
             ),
             "Did not get the expected parser warning"
         );
+    }
+
+    #[test]
+    fn test_utf8_error_in_comment() {
+        // invalid utf-8 in a comment before the AUTOSAR element, and in a comment inside it
+        let comment_before_root = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>
+    <!--\xff-->
+    <AUTOSAR xsi:schemaLocation=\"http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd\" xmlns=\"http://autosar.org/schema/r4.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">
+    <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME></AR-PACKAGE></AR-PACKAGES></AUTOSAR>";
+        let comment_inside_root = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>
+    <AUTOSAR xsi:schemaLocation=\"http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd\" xmlns=\"http://autosar.org/schema/r4.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">
+    <AR-PACKAGES><!--\xff--><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME></AR-PACKAGE></AR-PACKAGES></AUTOSAR>";
+        let is_utf8_error = |error: &AutosarDataError| {
+            matches!(
+                error,
+                AutosarDataError::ParserError {
+                    source: ArxmlParserError::Utf8Error { .. },
+                    ..
+                }
+            )
+        };
+
+        for buffer in [&comment_before_root[..], &comment_inside_root[..]] {
+            // strict: an error, like invalid utf-8 in character data
+            let model = AutosarModel::new();
+            let result = model.load_buffer(buffer, "test.arxml", true);
+            assert!(is_utf8_error(&result.unwrap_err()));
+
+            // non-strict: a warning, and the comment is kept with a replacement character
+            let model = AutosarModel::new();
+            let (_, warnings) = model.load_buffer(buffer, "test.arxml", false).unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert!(is_utf8_error(&warnings[0]));
+            let comments: Vec<String> = model.elements_dfs().filter_map(|(_, elem)| elem.comment()).collect();
+            assert_eq!(comments, ["\u{fffd}"]);
+        }
     }
 
     const UNEXPECTED_END_OF_FILE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
