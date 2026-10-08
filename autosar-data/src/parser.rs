@@ -265,7 +265,21 @@ pub enum ArxmlParserError {
         /// The element whose SHORT-NAME is empty
         element: ElementName,
     },
+
+    /// Elements are nested deeper than the parser allows
+    #[error("Elements are nested deeper than the limit of {limit} levels")]
+    ElementNestingTooDeep {
+        /// The maximum number of nested element levels, counting the AUTOSAR root element as one
+        limit: usize,
+    },
 }
+
+/// The maximum number of nested element levels in a file, counting the AUTOSAR root element as one.
+///
+/// The parser recurses once per level, so without a limit a deeply nested file overflows the stack
+/// and aborts the process. Real files stay far below this: the files from the `generate_files`
+/// example, which cover nearly the whole metamodel, nest at most 53 levels deep.
+const MAX_ELEMENT_NESTING_DEPTH: usize = 128;
 
 pub(crate) struct ArxmlParser<'a> {
     filename: PathBuf,
@@ -370,7 +384,7 @@ impl<'a> ArxmlParser<'a> {
                 comment: stored_comment,
             };
             let path = Cow::from("");
-            let autosar_root_element = self.parse_element(new_element, path, &mut lexer)?;
+            let autosar_root_element = self.parse_element(new_element, path, 1, &mut lexer)?;
             self.verify_end_of_input(&mut lexer)?;
 
             return Ok(autosar_root_element);
@@ -476,10 +490,13 @@ impl<'a> ArxmlParser<'a> {
     }
 
     /// parse a single element of an arxml file
+    ///
+    /// `depth` is the nesting level of the element, where the AUTOSAR root element is level 1
     fn parse_element(
         &mut self,
         raw_element: ElementRaw,
         mut path: Cow<str>,
+        depth: usize,
         lexer: &mut ArxmlLexer,
     ) -> Result<Element, AutosarDataError> {
         let wrapped_element = raw_element.wrap();
@@ -496,6 +513,13 @@ impl<'a> ArxmlParser<'a> {
             match arxmlevent {
                 ArxmlEvent::BeginElement(elem_text, attr_text) => {
                     if let Ok(name) = ElementName::from_bytes(elem_text) {
+                        // Each level of nesting costs a stack frame of this recursive function, so
+                        // the depth is limited, also when strict == false
+                        if depth >= MAX_ELEMENT_NESTING_DEPTH {
+                            return Err(self.error(ArxmlParserError::ElementNestingTooDeep {
+                                limit: MAX_ELEMENT_NESTING_DEPTH,
+                            }));
+                        }
                         let (sub_elemtype, idx) = self.find_element_in_spec_checked(name, element.elemtype)?;
                         self.check_element_conflict(name, element.elemtype, &elem_idx, &idx)?;
                         elem_idx = idx;
@@ -515,7 +539,8 @@ impl<'a> ArxmlParser<'a> {
                             file_membership: None,
                             comment: stored_comment,
                         };
-                        let sub_element = self.parse_element(new_element, Cow::from(path.as_ref()), lexer)?;
+                        let sub_element =
+                            self.parse_element(new_element, Cow::from(path.as_ref()), depth + 1, lexer)?;
                         stored_comment = None;
                         // if this sub element was a short name, then Autosar path handling is needed
                         if name == ElementName::ShortName {
@@ -1682,6 +1707,65 @@ mod test {
     fn test_additional_data_error() {
         let discriminant = std::mem::discriminant(&ArxmlParserError::AdditionalDataError);
         test_helper(ADDITIONAL_DATA.as_bytes(), discriminant, true);
+    }
+
+    /// A file whose innermost element, the SHORT-NAME of the innermost package, is nested `levels`
+    /// elements deep, counting the AUTOSAR element as level 1. `levels` must be even.
+    fn nested_packages_file(levels: usize) -> Vec<u8> {
+        // AUTOSAR, then AR-PACKAGES and AR-PACKAGE for each package, then the SHORT-NAME
+        let packages = (levels - 2) / 2;
+        let mut data = String::from(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+    <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+        );
+        data.push_str(&"<AR-PACKAGES><AR-PACKAGE><SHORT-NAME>p</SHORT-NAME>".repeat(packages));
+        data.push_str(&"</AR-PACKAGE></AR-PACKAGES>".repeat(packages));
+        data.push_str("</AUTOSAR>");
+        data.into_bytes()
+    }
+
+    #[test]
+    fn test_element_nesting_too_deep() {
+        // without a limit, every element level costs a stack frame of the recursive parser, and a
+        // deep enough file overflows the stack and aborts the process. The test runs on a thread
+        // with a 2 MiB stack, the default for spawned threads, to show that the limit leaves
+        // enough headroom in a debug build.
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                for strict in [true, false] {
+                    let model = AutosarModel::new();
+                    let deepest_allowed = nested_packages_file(MAX_ELEMENT_NESTING_DEPTH);
+                    assert!(model.load_buffer(&deepest_allowed, "allowed.arxml", strict).is_ok());
+
+                    // the limit is a hard error, also when strict == false
+                    let model = AutosarModel::new();
+                    let too_deep = nested_packages_file(MAX_ELEMENT_NESTING_DEPTH + 2);
+                    let result = model.load_buffer(&too_deep, "too_deep.arxml", strict);
+                    assert!(matches!(
+                        result,
+                        Err(AutosarDataError::ParserError {
+                            source: ArxmlParserError::ElementNestingTooDeep {
+                                limit: MAX_ELEMENT_NESTING_DEPTH
+                            },
+                            ..
+                        })
+                    ));
+
+                    let model = AutosarModel::new();
+                    let far_too_deep = nested_packages_file(100_000);
+                    let result = model.load_buffer(&far_too_deep, "far_too_deep.arxml", strict);
+                    assert!(matches!(
+                        result,
+                        Err(AutosarDataError::ParserError {
+                            source: ArxmlParserError::ElementNestingTooDeep { .. },
+                            ..
+                        })
+                    ));
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
     }
 
     #[test]
