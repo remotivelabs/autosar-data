@@ -3864,6 +3864,66 @@ mod test {
     }
 
     #[test]
+    fn rename_and_move_with_invalid_reference() {
+        // A non-strict load accepts a reference whose text is not a valid path, like "/Pkg/Sub/Sig!".
+        // Renaming or moving the package of its target must still update every reference and leave
+        // the reference caches consistent: this used to fail half way, after the new name had been
+        // set but before all references were rewritten, and with cache entries lost.
+        const FILE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<AUTOSAR xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd">
+<AR-PACKAGES>
+  <AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME>
+    <ELEMENTS><SYSTEM><SHORT-NAME>Sys</SHORT-NAME><FIBEX-ELEMENTS>
+      <FIBEX-ELEMENT-REF-CONDITIONAL><FIBEX-ELEMENT-REF DEST="I-SIGNAL">/Pkg/Sub/Sig!</FIBEX-ELEMENT-REF></FIBEX-ELEMENT-REF-CONDITIONAL>
+      <FIBEX-ELEMENT-REF-CONDITIONAL><FIBEX-ELEMENT-REF DEST="I-SIGNAL">/Pkg/Sub/Sig</FIBEX-ELEMENT-REF></FIBEX-ELEMENT-REF-CONDITIONAL>
+    </FIBEX-ELEMENTS></SYSTEM></ELEMENTS>
+    <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Sub</SHORT-NAME>
+      <ELEMENTS><I-SIGNAL><SHORT-NAME>Sig</SHORT-NAME></I-SIGNAL></ELEMENTS>
+    </AR-PACKAGE></AR-PACKAGES>
+  </AR-PACKAGE>
+  <AR-PACKAGE><SHORT-NAME>Other</SHORT-NAME>
+    <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Existing</SHORT-NAME></AR-PACKAGE></AR-PACKAGES>
+  </AR-PACKAGE>
+</AR-PACKAGES></AUTOSAR>"#;
+        let model = AutosarModel::new();
+        let (_, warnings) = model.load_buffer(FILE.as_bytes(), "test.arxml", false).unwrap();
+        assert!(
+            !warnings.is_empty(),
+            "the invalid reference is only accepted with a warning"
+        );
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+        let reference_texts = || -> Vec<String> {
+            let mut texts: Vec<String> = model
+                .elements_dfs()
+                .filter(|(_, elem)| elem.element_name() == ElementName::FibexElementRef)
+                .filter_map(|(_, elem)| elem.character_data()?.string_value())
+                .collect();
+            texts.sort();
+            texts
+        };
+
+        // rename the package that contains the target
+        let el_pkg = model.get_element_by_path("/Pkg").unwrap();
+        el_pkg.set_item_name("Renamed").unwrap();
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+        assert_eq!(reference_texts(), ["/Renamed/Sub/Sig", "/Renamed/Sub/Sig!"]);
+        assert_eq!(model.get_references_to("/Renamed/Sub/Sig").len(), 1);
+        assert_eq!(model.get_references_to("/Renamed/Sub/Sig!").len(), 1);
+
+        // move the package that contains the target
+        let el_sub = model.get_element_by_path("/Renamed/Sub").unwrap();
+        let el_other_packages = model
+            .get_element_by_path("/Other")
+            .and_then(|other| other.get_sub_element(ElementName::ArPackages))
+            .unwrap();
+        el_other_packages.move_element_here(&el_sub).unwrap();
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+        assert_eq!(reference_texts(), ["/Other/Sub/Sig", "/Other/Sub/Sig!"]);
+        assert_eq!(model.get_references_to("/Other/Sub/Sig").len(), 1);
+        assert_eq!(model.get_references_to("/Other/Sub/Sig!").len(), 1);
+    }
+
+    #[test]
     fn modify_character_data() {
         let model = AutosarModel::new();
         model.create_file("text.arxml", AutosarVersion::Autosar_00050).unwrap();

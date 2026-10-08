@@ -1334,13 +1334,11 @@ impl AutosarModel {
     /// This updates the keys of the `reference_origins` map, as well as the character data of each
     /// referring element, so that both absolute and relative references follow their target. The
     /// entries of `relative_references` are updated to the new keys.
-    pub(crate) fn fix_reference_paths(
-        &self,
-        remap: &PathRemap,
-        version: AutosarVersion,
-    ) -> Result<(), AutosarDataError> {
+    ///
+    /// This cannot fail, so that a rename or move never leaves the model half updated.
+    pub(crate) fn fix_reference_paths(&self, remap: &PathRemap) {
         if remap.is_noop() {
-            return Ok(());
+            return;
         }
         let mut model = self.0.write();
 
@@ -1369,7 +1367,7 @@ impl AutosarModel {
                         };
                         if let Some(new_content) = &new_content {
                             // can't use Element::set_character_data() here, because the model is locked
-                            ref_elem.0.write().set_character_data(new_content.clone(), version)?;
+                            ref_elem.0.write().set_remapped_reference(new_content.clone());
                         }
                         new_content
                     }
@@ -1398,8 +1396,6 @@ impl AutosarModel {
                 model.reference_origins.insert(refpath, unchanged);
             }
         }
-
-        Ok(())
     }
 
     // remove a deleted element from the cache
