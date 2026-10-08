@@ -371,8 +371,8 @@ impl<'a> ArxmlParser<'a> {
         if let ArxmlEvent::BeginElement(elemname, attributes_text) = token
             && let Ok(ElementName::Autosar) = ElementName::from_bytes(elemname)
         {
-            let attributes = self.parse_attribute_text(ElementType::ROOT, attributes_text)?;
-            self.parse_file_header(&attributes, attributes_text)?;
+            let mut attributes = self.parse_attribute_text(ElementType::ROOT, attributes_text)?;
+            self.parse_file_header(&mut attributes, attributes_text)?;
 
             let new_element = ElementRaw {
                 parent: ElementOrModel::None,
@@ -404,9 +404,12 @@ impl<'a> ArxmlParser<'a> {
     }
 
     /// parse the arxml file header
+    ///
+    /// A namespaceless header is completed with the regular namespace and schema attributes, so that
+    /// the file is written with a header that can be loaded again.
     fn parse_file_header(
         &mut self,
-        attributes: &SmallVec<[Attribute; 1]>,
+        attributes: &mut SmallVec<[Attribute; 1]>,
         attributes_text: &[u8],
     ) -> Result<(), AutosarDataError> {
         let attr_xmlns = attributes.iter().find(|attr| attr.attrname == AttributeName::xmlns);
@@ -440,6 +443,7 @@ impl<'a> ArxmlParser<'a> {
             // named by a bare schemaLocation. Strict parsing still refuses such a file.
             self.optional_error(ArxmlParserError::NamespacelessFileHeader)?;
             self.fileversion = self.parse_file_version(&schema)?;
+            set_root_header_attributes(attributes, self.fileversion);
 
             Ok(())
         } else {
@@ -1094,8 +1098,8 @@ impl<'a> ArxmlParser<'a> {
             }
             if let Ok(ArxmlEvent::BeginElement(elemname, attributes_text)) = arxmlevent
                 && let Ok(ElementName::Autosar) = ElementName::from_bytes(elemname)
-                && let Ok(attributes) = self.parse_attribute_text(ElementType::ROOT, attributes_text)
-                && self.parse_file_header(&attributes, attributes_text).is_ok()
+                && let Ok(mut attributes) = self.parse_attribute_text(ElementType::ROOT, attributes_text)
+                && self.parse_file_header(&mut attributes, attributes_text).is_ok()
             {
                 // no errors after parsing the header - this looks like an arxml file
                 return true;
@@ -1103,6 +1107,29 @@ impl<'a> ArxmlParser<'a> {
         }
 
         false
+    }
+}
+
+/// Set the namespace and schema attributes of the AUTOSAR element to the values every regular file has
+fn set_root_header_attributes(attributes: &mut SmallVec<[Attribute; 1]>, version: AutosarVersion) {
+    let header = [
+        (
+            AttributeName::xsiSchemalocation,
+            format!("http://autosar.org/schema/r4.0 {}", version.filename()),
+        ),
+        (AttributeName::xmlns, "http://autosar.org/schema/r4.0".to_string()),
+        (
+            AttributeName::xmlnsXsi,
+            "http://www.w3.org/2001/XMLSchema-instance".to_string(),
+        ),
+    ];
+    for (attrname, value) in header {
+        let content = CharacterData::String(value);
+        if let Some(attribute) = attributes.iter_mut().find(|attr| attr.attrname == attrname) {
+            attribute.content = content;
+        } else {
+            attributes.push(Attribute { attrname, content });
+        }
     }
 }
 
@@ -1166,6 +1193,25 @@ mod test {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn test_file_header_without_namespaces_round_trip() {
+        // a file with a namespaceless header must serialize with a header that can be loaded again
+        let data =
+            br#"<?xml version="1.0" ?><AUTOSAR schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00049.xsd">
+        <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME></AR-PACKAGE></AR-PACKAGES></AUTOSAR>"#;
+        let model = crate::AutosarModel::new();
+        let (file, _warnings) = model.load_buffer(data, "test.arxml", false).unwrap();
+        let serialized = file.serialize().unwrap();
+
+        // the serialized header is a regular one, so even strict parsing accepts it
+        let model2 = crate::AutosarModel::new();
+        let (file2, warnings2) = model2.load_buffer(serialized.as_bytes(), "test.arxml", true).unwrap();
+        assert!(warnings2.is_empty());
+        assert_eq!(file2.version(), AutosarVersion::Autosar_00049);
+        assert!(model2.get_element_by_path("/Pkg").is_some());
+        assert_eq!(file2.serialize().unwrap(), serialized);
     }
 
     use crate::*;
