@@ -172,15 +172,15 @@ pub fn validate_8_chunked(s: &[u8]) -> bool {
         return false;
     }
     let mut ok = true;
-    let mut chunks = rest.chunks_exact(16);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = rest.as_chunks::<16>();
+    for chunk in chunks {
         let mut chunk_ok = true;
         for &c in chunk {
             chunk_ok &= is_word(c);
         }
         ok &= chunk_ok;
     }
-    for &c in chunks.remainder() {
+    for &c in remainder {
         ok &= is_word(c);
     }
     ok
