@@ -1037,7 +1037,17 @@ impl<'a> ArxmlParser<'a> {
         }
     }
 
+    /// `input` with its line ends as XML reads them and its entities resolved: a CRLF or a lone
+    /// CR is one LF (XML 1.0, 2.11 End-of-Line Handling), whatever the file used.
     fn unescape_string<'b>(&mut self, input: &'b str) -> Result<Cow<'b, str>, AutosarDataError> {
+        if input.contains('\r') {
+            let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+            return Ok(Cow::Owned(self.unescape_entities(&normalized)?.into_owned()));
+        }
+        self.unescape_entities(input)
+    }
+
+    fn unescape_entities<'b>(&mut self, input: &'b str) -> Result<Cow<'b, str>, AutosarDataError> {
         if input.contains('&') {
             let mut unescaped = String::with_capacity(input.len());
             let mut rem = input;
@@ -1978,6 +1988,15 @@ mod test {
         // values from 0x110000 to 0x1FFFFF are not valid unicode code points -> 0x110000 = 1114112
         let result = parser.unescape_string("&#1114112;");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn line_ends_are_normalized() {
+        let mut parser = ArxmlParser::new(PathBuf::from("test_buffer.arxml"), &[], true);
+        let result = parser.unescape_string("one\r\ntwo\rthree\n&amp;").unwrap();
+        assert_eq!(&result, "one\ntwo\nthree\n&");
+        let result = parser.unescape_string("no carriage return").unwrap();
+        assert!(matches!(result, Cow::Borrowed(_)));
     }
 
     const PARSER_TEST_DATA: &str = r#"<?xml version="1.0" encoding="utf-8"?>

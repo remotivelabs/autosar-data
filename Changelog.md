@@ -16,6 +16,7 @@
 - Extra spaces around the `=` in an attribute and around the closing `>` of an end tag (`</ELEMENT   >`) are now accepted
 - Duplicate attributes on an element are now detected, which is an error in strict mode and otherwise resolved by keeping the last value
 - An empty SHORT-NAME (`<SHORT-NAME></SHORT-NAME>`, or one containing only whitespace or a comment) is now rejected with the new error `ArxmlParserError::EmptyShortName`.
+- Line ends in character data are normalized as XML requires: a CRLF or a lone CR becomes LF, so a file with Windows line ends reads the same as one without
 
 **Concurrency**
 
