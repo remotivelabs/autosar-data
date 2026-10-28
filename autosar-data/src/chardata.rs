@@ -395,8 +395,10 @@ impl PartialOrd for CharacterData {
 
 impl Eq for CharacterData {}
 
+/// `input` as XML text. A carriage return is written as a character reference, since a reader
+/// turns a literal one into a line feed (XML 1.0, 2.11 End-of-Line Handling).
 fn escape_text<'a>(input: &'a str) -> Cow<'a, str> {
-    if input.contains(['&', '>', '<', '\'', '"']) {
+    if input.contains(['&', '>', '<', '\'', '"', '\r']) {
         let mut escaped = String::with_capacity(input.len() + 6);
 
         for c in input.chars() {
@@ -406,6 +408,7 @@ fn escape_text<'a>(input: &'a str) -> Cow<'a, str> {
                 '&' => escaped.push_str("&amp;"),
                 '"' => escaped.push_str("&quot;"),
                 '\'' => escaped.push_str("&apos;"),
+                '\r' => escaped.push_str("&#xD;"),
                 other => escaped.push(other),
             }
         }
