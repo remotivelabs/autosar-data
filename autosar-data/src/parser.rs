@@ -403,13 +403,14 @@ impl<'a> ArxmlParser<'a> {
 
     /// convert the text of a comment to a string; invalid utf-8 is an error when strict == true
     fn parse_comment(&mut self, comment_bytes: &[u8]) -> Result<String, AutosarDataError> {
-        match std::str::from_utf8(comment_bytes) {
-            Ok(comment) => Ok(comment.to_owned()),
+        let comment = match std::str::from_utf8(comment_bytes) {
+            Ok(comment) => Cow::Borrowed(comment),
             Err(err) => {
                 self.optional_error(ArxmlParserError::Utf8Error { source: err })?;
-                Ok(String::from_utf8_lossy(comment_bytes).into_owned())
+                String::from_utf8_lossy(comment_bytes)
             }
-        }
+        };
+        Ok(normalize_line_ends(&comment).into_owned())
     }
 
     /// parse the arxml file header
@@ -1037,7 +1038,15 @@ impl<'a> ArxmlParser<'a> {
         }
     }
 
+    /// `input` with its line ends normalized, then its entities resolved, so a `&#xD;` stays a CR.
     fn unescape_string<'b>(&mut self, input: &'b str) -> Result<Cow<'b, str>, AutosarDataError> {
+        match normalize_line_ends(input) {
+            Cow::Borrowed(input) => self.unescape_entities(input),
+            Cow::Owned(normalized) => Ok(Cow::Owned(self.unescape_entities(&normalized)?.into_owned())),
+        }
+    }
+
+    fn unescape_entities<'b>(&mut self, input: &'b str) -> Result<Cow<'b, str>, AutosarDataError> {
         if input.contains('&') {
             let mut unescaped = String::with_capacity(input.len());
             let mut rem = input;
@@ -1154,6 +1163,16 @@ impl<'a> ArxmlParser<'a> {
 }
 
 /// Set the namespace and schema attributes of the AUTOSAR element to the values every regular file has
+/// `input` with its line ends as XML reads them: a CRLF or a lone CR is one LF (XML 1.0, 2.11
+/// End-of-Line Handling), whatever the file used.
+fn normalize_line_ends(input: &str) -> Cow<'_, str> {
+    if input.contains('\r') {
+        Cow::Owned(input.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(input)
+    }
+}
+
 fn set_root_header_attributes(attributes: &mut SmallVec<[Attribute; 1]>, version: AutosarVersion) {
     let header = [
         (
@@ -1978,6 +1997,55 @@ mod test {
         // values from 0x110000 to 0x1FFFFF are not valid unicode code points -> 0x110000 = 1114112
         let result = parser.unescape_string("&#1114112;");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn line_ends_are_normalized() {
+        let mut parser = ArxmlParser::new(PathBuf::from("test_buffer.arxml"), &[], true);
+        let result = parser.unescape_string("one\r\ntwo\rthree\n&amp;").unwrap();
+        assert_eq!(&result, "one\ntwo\nthree\n&");
+        let result = parser.unescape_string("no carriage return").unwrap();
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    const LINE_ENDS_TEST_DATA: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r
+<AUTOSAR xsi:schemaLocation=\"http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd\" xmlns=\"http://autosar.org/schema/r4.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\r
+<AR-PACKAGES><!--one\r\ntwo\rthree--><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME>\r
+<LONG-NAME><L-4 L=\"EN\">one\r\ntwo&#xD;three&#13;</L-4></LONG-NAME>\r
+</AR-PACKAGE></AR-PACKAGES></AUTOSAR>";
+
+    fn long_name(model: &AutosarModel) -> CharacterData {
+        model
+            .get_element_by_path("/Pkg")
+            .and_then(|pkg| pkg.get_sub_element(ElementName::LongName))
+            .and_then(|long_name| long_name.get_sub_element(ElementName::L4))
+            .and_then(|l4| l4.character_data())
+            .unwrap()
+    }
+
+    #[test]
+    fn line_ends_in_comments_are_normalized() {
+        let model = AutosarModel::new();
+        model
+            .load_buffer(LINE_ENDS_TEST_DATA.as_bytes(), "test.arxml", true)
+            .unwrap();
+        let comments: Vec<String> = model.elements_dfs().filter_map(|(_, elem)| elem.comment()).collect();
+        assert_eq!(comments, ["one\ntwo\nthree"]);
+    }
+
+    #[test]
+    fn character_reference_to_carriage_return_survives_save_and_reload() {
+        let model = AutosarModel::new();
+        let (file, _) = model
+            .load_buffer(LINE_ENDS_TEST_DATA.as_bytes(), "test.arxml", true)
+            .unwrap();
+        let expected = CharacterData::String("one\ntwo\rthree\r".to_string());
+        assert_eq!(long_name(&model), expected);
+
+        let saved = file.serialize().unwrap();
+        let reloaded = AutosarModel::new();
+        reloaded.load_buffer(saved.as_bytes(), "test.arxml", true).unwrap();
+        assert_eq!(long_name(&reloaded), expected);
     }
 
     const PARSER_TEST_DATA: &str = r#"<?xml version="1.0" encoding="utf-8"?>
