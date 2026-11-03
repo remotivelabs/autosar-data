@@ -2464,6 +2464,8 @@ impl Element {
     ///
     /// If the new comment value contains "--", then this is replaced with "__", because "--" is forbidden inside XML comments.
     ///
+    /// Line ends are stored as LF, as loading a file reads them, so the comment is the same after saving and loading.
+    ///
     /// # Example
     ///
     /// ```
@@ -2480,6 +2482,9 @@ impl Element {
             // make sure the comment we store never contains "--" as this is forbidden by the w3 xml specification
             if comment.contains("--") {
                 *comment = comment.replace("--", "__");
+            }
+            if let std::borrow::Cow::Owned(normalized) = crate::parser::normalize_line_ends(comment) {
+                *comment = normalized;
             }
         }
         self.0.write().comment = opt_comment;
