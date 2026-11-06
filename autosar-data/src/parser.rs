@@ -867,7 +867,8 @@ impl<'a> ArxmlParser<'a> {
                             version: self.fileversion,
                         },
                     )?;
-                    let attr_value = self.parse_character_data(attr_value_part, ctype)?;
+                    let attr_value_part = normalize_attribute_whitespace(attr_value_part);
+                    let attr_value = self.parse_character_data(&attr_value_part, ctype)?;
                     if let Some(pos) = attributes
                         .iter()
                         .position(|attr: &Attribute| attr.attrname == attr_name)
@@ -1179,6 +1180,28 @@ pub(crate) fn normalize_line_ends(input: &str) -> Cow<'_, str> {
             chars.next_if_eq(&'\n');
         } else {
             normalized.push(c);
+        }
+    }
+    Cow::Owned(normalized)
+}
+
+/// A raw attribute value with each literal TAB, LF, CR or CRLF read as one space, as XML 1.0 (3.3.3
+/// Attribute-Value Normalization) has a parser read it; a character reference such as `&#xA;` is
+/// resolved later and keeps its character.
+fn normalize_attribute_whitespace(value: &[u8]) -> Cow<'_, [u8]> {
+    if !value.iter().any(|c| matches!(c, b'\t' | b'\n' | b'\r')) {
+        return Cow::Borrowed(value);
+    }
+    let mut normalized = Vec::with_capacity(value.len());
+    let mut bytes = value.iter().peekable();
+    while let Some(&c) = bytes.next() {
+        match c {
+            b'\r' => {
+                bytes.next_if_eq(&&b'\n');
+                normalized.push(b' ');
+            }
+            b'\t' | b'\n' => normalized.push(b' '),
+            other => normalized.push(other),
         }
     }
     Cow::Owned(normalized)
@@ -2022,7 +2045,7 @@ mod test {
 
     const LINE_ENDS_TEST_DATA: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r
 <AUTOSAR xsi:schemaLocation=\"http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd\" xmlns=\"http://autosar.org/schema/r4.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\r
-<AR-PACKAGES><!--one\r\ntwo\rthree--><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME>\r
+<AR-PACKAGES><!--one\r\ntwo\rthree--><AR-PACKAGE UUID=\"one\r\ntwo\rthree\tfour\nfive&#xA;six&#x9;\"><SHORT-NAME>Pkg</SHORT-NAME>\r
 <LONG-NAME><L-4 L=\"EN\">one\r\ntwo&#xD;three&#13;</L-4></LONG-NAME>\r
 </AR-PACKAGE></AR-PACKAGES></AUTOSAR>";
 
@@ -2033,6 +2056,32 @@ mod test {
             .and_then(|long_name| long_name.get_sub_element(ElementName::L4))
             .and_then(|l4| l4.character_data())
             .unwrap()
+    }
+
+    fn uuid(model: &AutosarModel) -> CharacterData {
+        model
+            .get_element_by_path("/Pkg")
+            .and_then(|pkg| pkg.attribute_value(AttributeName::Uuid))
+            .unwrap()
+    }
+
+    #[test]
+    fn whitespace_in_attributes_is_normalized_and_survives_save_and_reload() {
+        let model = AutosarModel::new();
+        let (file, _) = model
+            .load_buffer(LINE_ENDS_TEST_DATA.as_bytes(), "test.arxml", true)
+            .unwrap();
+        let expected = CharacterData::String("one two three four five\nsix\t".to_string());
+        assert_eq!(uuid(&model), expected);
+
+        let saved = file.serialize().unwrap();
+        assert!(
+            saved.contains("UUID=\"one two three four five&#xA;six&#x9;\""),
+            "{saved}"
+        );
+        let reloaded = AutosarModel::new();
+        reloaded.load_buffer(saved.as_bytes(), "test.arxml", true).unwrap();
+        assert_eq!(uuid(&reloaded), expected);
     }
 
     #[test]

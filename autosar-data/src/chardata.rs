@@ -120,9 +120,19 @@ impl CharacterData {
     pub(crate) fn serialize_internal(&self, outstring: &mut String) {
         match self {
             CharacterData::Enum(enumval) => outstring.push_str(enumval.to_str()),
-            CharacterData::String(strval) => outstring.push_str(&escape_text(strval)),
+            CharacterData::String(strval) => outstring.push_str(&escape_text(strval, false)),
             CharacterData::UnsignedInteger(intval) => outstring.push_str(&intval.to_string()),
             CharacterData::Float(floatval) => outstring.push_str(&floatval.to_string()),
+        }
+    }
+
+    /// As `serialize_internal`, for an attribute value: a line feed or tab is written as a
+    /// character reference, since a reader turns a literal one into a space (XML 1.0, 3.3.3
+    /// Attribute-Value Normalization).
+    pub(crate) fn serialize_attribute_internal(&self, outstring: &mut String) {
+        match self {
+            CharacterData::String(strval) => outstring.push_str(&escape_text(strval, true)),
+            other => other.serialize_internal(outstring),
         }
     }
 
@@ -396,9 +406,10 @@ impl PartialOrd for CharacterData {
 impl Eq for CharacterData {}
 
 /// `input` as XML text. A carriage return is written as a character reference, since a reader
-/// turns a literal one into a line feed (XML 1.0, 2.11 End-of-Line Handling).
-fn escape_text<'a>(input: &'a str) -> Cow<'a, str> {
-    if input.contains(['&', '>', '<', '\'', '"', '\r']) {
+/// turns a literal one into a line feed (XML 1.0, 2.11 End-of-Line Handling); in an attribute, a
+/// line feed and a tab are too.
+fn escape_text<'a>(input: &'a str, attribute: bool) -> Cow<'a, str> {
+    if input.contains(['&', '>', '<', '\'', '"', '\r']) || (attribute && input.contains(['\n', '\t'])) {
         let mut escaped = String::with_capacity(input.len() + 6);
 
         for c in input.chars() {
@@ -409,6 +420,8 @@ fn escape_text<'a>(input: &'a str) -> Cow<'a, str> {
                 '"' => escaped.push_str("&quot;"),
                 '\'' => escaped.push_str("&apos;"),
                 '\r' => escaped.push_str("&#xD;"),
+                '\n' if attribute => escaped.push_str("&#xA;"),
+                '\t' if attribute => escaped.push_str("&#x9;"),
                 other => escaped.push(other),
             }
         }
