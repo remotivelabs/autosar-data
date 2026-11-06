@@ -1583,7 +1583,7 @@ impl ElementRaw {
                 outstring.push(' ');
                 outstring.push_str(attribute.attrname.to_str());
                 outstring.push_str("=\"");
-                attribute.content.serialize_internal(outstring);
+                attribute.content.serialize_attribute_internal(outstring);
                 outstring.push('"');
             }
         }
